@@ -61,20 +61,21 @@ jobs:
           mkdir -p device_tree
           python -m aospdtgen dumpyara_output/ -o device_tree/
 
-      # 🔧 Android source tree structure banao jahan hum device tree aur vendor blobs rakh sakain
+      # Android source tree structure banao jahan device tree aur vendor blobs rakh sakain
       - name: Prepare Android source tree structure
         run: |
           mkdir -p android/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
           mkdir -p android/vendor/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
           cp -r device_tree/* android/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/
 
-      # 📥 Proprietary blobs extract karo (extract-files.sh jo aospdtgen ne banaya tha)
+      # 📥 Proprietary blobs extract karo (extract-files.py jo aospdtgen ne banaya hai)
       - name: Extract proprietary blobs from dump
         working-directory: android/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
         run: |
+          # aospdtgen ke folder ko PYTHONPATH mein add karo taake extract_utils module mil jaye
+          export PYTHONPATH="$PYTHONPATH:${{ github.workspace }}/aospdtgen"
           chmod +x extract-files.py
-          # dumpyara_output ka absolute path do
-          ./extract-files.py ${{ github.workspace }}/dumpyara_output/
+          python extract-files.py ${{ github.workspace }}/dumpyara_output/
           # Ab android/vendor/ folder blobs se bhar jana chahiye
 
       # 📦 Device tree + vendor blobs dono ko package karo
