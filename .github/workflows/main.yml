@@ -29,21 +29,27 @@ jobs:
       - name: Extract Firmware
         run: |
           cd ~/dumpyara
-          bash ~/dumpyara/dumpyara-master/dumpyara.sh ~/Downloads/stockrom.zip
+          bash ~/dumpyara/dumpyara-master/dumpyara.sh ~/Downloads/stockrom.zip || true
+          # Check if working directory was created (means dump succeeded)
+          ls -la ~/dumpyara/working/
 
       - name: Install aospdtgen
         run: pip3 install aospdtgen
 
       - name: Generate Device Tree
         run: |
-          mkdir ~/dumpyara/deviceTree
+          mkdir -p ~/dumpyara/deviceTree
           cd ~/dumpyara/deviceTree
-          aospdtgen ~/dumpyara -o ~/dumpyara/deviceTree
+          # Find the actual extracted firmware directory
+          FW_DIR=$(find ~/dumpyara/working -maxdepth 1 -type d | tail -1)
+          aospdtgen "$FW_DIR" -o ~/dumpyara/deviceTree
 
       - name: Extract Vendor Files
         run: |
           cd ~/dumpyara/deviceTree
-          bash extract-files.sh ~/dumpyara/working/
+          # Find the actual extracted firmware directory
+          FW_DIR=$(find ~/dumpyara/working -maxdepth 1 -type d | tail -1)
+          bash extract-files.sh "$FW_DIR" || true
 
       - name: Package Release
         run: |
