@@ -30,8 +30,10 @@ jobs:
         run: |
           cd ~/dumpyara
           bash ~/dumpyara/dumpyara-master/dumpyara.sh ~/Downloads/stockrom.zip || true
-          # Find what directory was created
-          echo "Contents of ~/dumpyara:"
+          # Debug: find all directories created
+          echo "Finding extracted directories..."
+          find ~ -maxdepth 3 -type d -name "*x659b*" -o -name "*infinix*" -o -name "*dump*" 2>/dev/null | head -20
+          echo "All directories in ~/dumpyara:"
           ls -la ~/dumpyara/
 
       - name: Install aospdtgen
@@ -40,17 +42,27 @@ jobs:
       - name: Generate Device Tree
         run: |
           mkdir -p ~/dumpyara/deviceTree
-          # Find the extracted firmware directory (exclude dumpyara-master and deviceTree)
-          FW_DIR=$(find ~/dumpyara -maxdepth 1 -type d ! -name "dumpyara-master" ! -name "deviceTree" ! -name "dumpyara" | tail -1)
+          # Find the extracted firmware directory (look for system or vendor dirs)
+          FW_DIR=$(find ~/dumpyara -type d -name "system" -o -name "vendor" 2>/dev/null | head -1 | xargs dirname 2>/dev/null || echo "")
+          if [ -z "$FW_DIR" ]; then
+            # Fallback: look for any directory with boot.img
+            FW_DIR=$(find ~/dumpyara -name "boot.img" -type f 2>/dev/null | head -1 | xargs dirname 2>/dev/null || echo "")
+          fi
           echo "Using firmware dir: $FW_DIR"
-          aospdtgen "$FW_DIR" -o ~/dumpyara/deviceTree
+          if [ -n "$FW_DIR" ] && [ -d "$FW_DIR" ]; then
+            aospdtgen "$FW_DIR" -o ~/dumpyara/deviceTree
+          else
+            echo "ERROR: Could not find firmware directory"
+            exit 1
+          fi
 
       - name: Extract Vendor Files
         run: |
           cd ~/dumpyara/deviceTree
-          # Find the extracted firmware directory again
-          FW_DIR=$(find ~/dumpyara -maxdepth 1 -type d ! -name "dumpyara-master" ! -name "deviceTree" ! -name "dumpyara" | tail -1)
-          bash extract-files.sh "$FW_DIR" || true
+          FW_DIR=$(find ~/dumpyara -type d -name "system" -o -name "vendor" 2>/dev/null | head -1 | xargs dirname 2>/dev/null || echo "")
+          if [ -n "$FW_DIR" ]; then
+            bash extract-files.sh "$FW_DIR" || true
+          fi
 
       - name: Package Release
         run: |
