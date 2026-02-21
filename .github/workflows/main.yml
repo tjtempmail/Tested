@@ -1,4 +1,4 @@
-name: Device Tree & Vendor Blobs Generator
+name: Device Tree & Vendor Blobs Generator (Release Archive)
 
 on:
   workflow_dispatch:
@@ -22,22 +22,25 @@ on:
         required: true
         default: '21.0'
         type: string
-      branch_name:
-        description: 'Branch name for device tree repo'
+      archive_format:
+        description: 'Archive format for release'
         required: true
-        default: 'main'
-        type: string
+        default: 'zip'
+        type: choice
+        options:
+          - zip
+          - tar.gz
+          - both
 
 env:
   WORK_DIR: ${{ github.workspace }}
   DUMP_DIR: ${{ github.workspace }}/dumpyara
   DT_DIR: ${{ github.workspace }}/device_tree
   VENDOR_DIR: ${{ github.workspace }}/vendor_blobs
-  GIT_USER_NAME: ${{ github.actor }}
-  GIT_USER_EMAIL: ${{ github.actor }}@users.noreply.github.com
+  RELEASE_DIR: ${{ github.workspace }}/release
 
 jobs:
-  generate-device-tree:
+  generate-and-package:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     
@@ -76,7 +79,9 @@ jobs:
             liblz4-tool \
             brotli \
             android-sdk-libsparse-utils \
-            jq
+            jq \
+            tar \
+            gzip
 
       - name: Setup Python environment
         run: |
@@ -127,18 +132,6 @@ jobs:
           # List contents for debugging
           ls -la "$EXTRACTED_DIR"
 
-      - name: Generate device tree with aospdtgen
-        run: |
-          mkdir -p ${{ env.DT_DIR }}
-          
-          echo "Generating device tree..."
-          aospdtgen "${{ steps.dump_firmware.outputs.extracted_path }}" \
-            -o "${{ env.DT_DIR }}" \
-            --kernel-source "https://github.com/${{ github.repository_owner }}/android_kernel_${{ github.event.inputs.device_manufacturer }}_${{ github.event.inputs.device_codename }}"
-          
-          echo "Device tree generated at: ${{ env.DT_DIR }}"
-          find ${{ env.DT_DIR }} -type f -name "*.mk" -o -name "*.bp" -o -name "*.sh" | head -20
-
       - name: Detect device info
         id: device_info
         run: |
@@ -149,21 +142,60 @@ jobs:
           if [ -f "$VENDOR_BUILD_PROP" ]; then
             DEVICE_NAME=$(grep -E "^ro.product.vendor.device=" "$VENDOR_BUILD_PROP" | cut -d'=' -f2 || echo "${{ github.event.inputs.device_codename }}")
             DEVICE_MODEL=$(grep -E "^ro.product.vendor.model=" "$VENDOR_BUILD_PROP" | cut -d'=' -f2 || echo "Unknown")
+            BUILD_FINGERPRINT=$(grep -E "^ro.vendor.build.fingerprint=" "$VENDOR_BUILD_PROP" | cut -d'=' -f2 || echo "Unknown")
           elif [ -f "$SYSTEM_BUILD_PROP" ]; then
             DEVICE_NAME=$(grep -E "^ro.product.system.device=" "$SYSTEM_BUILD_PROP" | cut -d'=' -f2 || echo "${{ github.event.inputs.device_codename }}")
             DEVICE_MODEL=$(grep -E "^ro.product.system.model=" "$SYSTEM_BUILD_PROP" | cut -d'=' -f2 || echo "Unknown")
+            BUILD_FINGERPRINT=$(grep -E "^ro.system.build.fingerprint=" "$SYSTEM_BUILD_PROP" | cut -d'=' -f2 || echo "Unknown")
           else
             DEVICE_NAME="${{ github.event.inputs.device_codename }}"
             DEVICE_MODEL="Unknown"
+            BUILD_FINGERPRINT="Unknown"
+          fi
+          
+          # Get Android version from build.prop
+          if [ -f "$VENDOR_BUILD_PROP" ]; then
+            ANDROID_VERSION=$(grep -E "^ro.vendor.build.version.release=" "$VENDOR_BUILD_PROP" | cut -d'=' -f2 || echo "Unknown")
+          elif [ -f "$SYSTEM_BUILD_PROP" ]; then
+            ANDROID_VERSION=$(grep -E "^ro.system.build.version.release=" "$SYSTEM_BUILD_PROP" | cut -d'=' -f2 || echo "Unknown")
+          else
+            ANDROID_VERSION="Unknown"
           fi
           
           echo "device_name=$DEVICE_NAME" >> $GITHUB_OUTPUT
           echo "device_model=$DEVICE_MODEL" >> $GITHUB_OUTPUT
+          echo "build_fingerprint=$BUILD_FINGERPRINT" >> $GITHUB_OUTPUT
+          echo "stock_android_version=$ANDROID_VERSION" >> $GITHUB_OUTPUT
+          
           echo "Detected device: $DEVICE_NAME ($DEVICE_MODEL)"
+          echo "Stock Android: $ANDROID_VERSION"
+          echo "Fingerprint: $BUILD_FINGERPRINT"
 
-      - name: Prepare vendor blobs extraction script
+      - name: Generate device tree with aospdtgen
         run: |
-          DT_PATH="${{ env.DT_DIR }}/android_device_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}"
+          mkdir -p ${{ env.DT_DIR }}
+          
+          echo "Generating device tree..."
+          aospdtgen "${{ steps.dump_firmware.outputs.extracted_path }}" \
+            -o "${{ env.DT_DIR }}" \
+            --kernel-source "https://github.com/user/android_kernel_${{ github.event.inputs.device_manufacturer }}_${{ github.event.inputs.device_codename }}"
+          
+          echo "Device tree generated at: ${{ env.DT_DIR }}"
+          
+          # Find the generated device tree directory
+          DT_GENERATED=$(find ${{ env.DT_DIR }} -maxdepth 1 -type d -name "android_device_*" | head -n 1)
+          if [ -z "$DT_GENERATED" ]; then
+            echo "::error::No device tree directory found!"
+            find ${{ env.DT_DIR }} -type d
+            exit 1
+          fi
+          
+          echo "dt_path=$DT_GENERATED" >> $GITHUB_ENV
+          echo "Device tree location: $DT_GENERATED"
+
+      - name: Prepare vendor blobs extraction
+        run: |
+          DT_PATH="${{ env.dt_path }}"
           
           if [ -d "$DT_PATH" ]; then
             cd "$DT_PATH"
@@ -172,257 +204,272 @@ jobs:
             if [ -f "extract-files.sh" ]; then
               chmod +x extract-files.sh
               echo "Found extract-files.sh"
-            else
-              echo "::warning::extract-files.sh not found in device tree"
+            fi
+            
+            if [ -f "setup-makefiles.sh" ]; then
+              chmod +x setup-makefiles.sh
+              echo "Found setup-makefiles.sh"
             fi
             
             # List device tree structure
             echo "Device tree structure:"
-            tree -L 2 "$DT_PATH" || find "$DT_PATH" -maxdepth 2 -type f
+            find "$DT_PATH" -maxdepth 2 -type f | head -30
           else
             echo "::warning::Device tree path not found: $DT_PATH"
-            find ${{ env.DT_DIR }} -type d
           fi
 
       - name: Extract vendor blobs
         run: |
-          DT_PATH="${{ env.DT_DIR }}/android_device_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}"
+          DT_PATH="${{ env.dt_path }}"
           VENDOR_EXTRACT_PATH="${{ steps.dump_firmware.outputs.extracted_path }}"
           
-          mkdir -p ${{ env.VENDOR_DIR }}
+          mkdir -p ${{ env.VENDOR_DIR }}/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}
           
           if [ -f "$DT_PATH/extract-files.sh" ]; then
             echo "Running extract-files.sh..."
             cd "$DT_PATH"
             
+            # Create a temporary directory for extraction
+            mkdir -p /tmp/vendor_extract
+            VENDOR_OUT="/tmp/vendor_extract"
+            
             # Run extraction pointing to dumpyara output
-            ./extract-files.sh "$VENDOR_EXTRACT_PATH" || {
+            ./extract-files.sh "$VENDOR_EXTRACT_PATH" 2>&1 || {
               echo "::warning::extract-files.sh failed, performing manual extraction..."
-              
-              # Fallback: Manual vendor blob extraction
-              mkdir -p ${{ env.VENDOR_DIR }}/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}
-              
-              # Copy common vendor directories
-              for dir in vendor system vendor_dlkm system_ext product; do
-                if [ -d "$VENDOR_EXTRACT_PATH/$dir" ]; then
-                  echo "Copying $dir..."
-                  cp -r "$VENDOR_EXTRACT_PATH/$dir" ${{ env.VENDOR_DIR }}/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}/
-                fi
-              done
             }
-          else
-            echo "Performing manual vendor blob extraction..."
-            mkdir -p ${{ env.VENDOR_DIR }}/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}
             
-            # Copy vendor partition
-            if [ -d "$VENDOR_EXTRACT_PATH/vendor" ]; then
-              cp -r "$VENDOR_EXTRACT_PATH/vendor" ${{ env.VENDOR_DIR }}/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}/
+            # Check if extraction created vendor directory
+            if [ -d "$DT_PATH/../vendor" ]; then
+              cp -r "$DT_PATH/../vendor/"* ${{ env.VENDOR_DIR }}/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}/ 2>/dev/null || true
             fi
-            
-            # Copy other partitions if they exist
-            for partition in system system_ext product vendor_dlkm odm; do
-              if [ -d "$VENDOR_EXTRACT_PATH/$partition" ]; then
-                echo "Copying $partition partition..."
-                cp -r "$VENDOR_EXTRACT_PATH/$partition" ${{ env.VENDOR_DIR }}/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}/
-              fi
-            done
+          fi
+          
+          # Always perform manual backup extraction to ensure we have all blobs
+          echo "Performing comprehensive vendor blob extraction..."
+          
+          # Copy vendor partition
+          if [ -d "$VENDOR_EXTRACT_PATH/vendor" ]; then
+            echo "Copying vendor partition..."
+            cp -r "$VENDOR_EXTRACT_PATH/vendor" ${{ env.VENDOR_DIR }}/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}/
+          fi
+          
+          # Copy other partitions
+          for partition in system system_ext product vendor_dlkm odm odm_dlkm; do
+            if [ -d "$VENDOR_EXTRACT_PATH/$partition" ]; then
+              echo "Copying $partition partition..."
+              cp -r "$VENDOR_EXTRACT_PATH/$partition" ${{ env.VENDOR_DIR }}/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}/
+            fi
+          done
+          
+          # Copy proprietary-files.txt if generated
+          if [ -f "$DT_PATH/proprietary-files.txt" ]; then
+            cp "$DT_PATH/proprietary-files.txt" ${{ env.VENDOR_DIR }}/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}/
           fi
 
-      - name: Create vendor blobs repository structure
+      - name: Create vendor repository structure
         run: |
           VENDOR_REPO="${{ env.VENDOR_DIR }}/android_vendor_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}"
           mkdir -p "$VENDOR_REPO"
           
           # Move extracted blobs to proper structure
-          if [ -d "${{ env.VENDOR_DIR }}/${{ github.event.inputs.device_manufacturer }}" ]; then
+          if [ -d "${{ env.VENDOR_DIR }}/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}" ]; then
             mv ${{ env.VENDOR_DIR }}/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}/* "$VENDOR_REPO/" 2>/dev/null || true
+            rmdir ${{ env.VENDOR_DIR }}/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }} 2>/dev/null || true
           fi
           
-          # Create Android.bp if it doesn't exist
-          if [ ! -f "$VENDOR_REPO/Android.bp" ]; then
-            cat > "$VENDOR_REPO/Android.bp" << 'EOF'
-            // Automatically generated vendor blobs
-            package {
-                default_applicable_licenses: ["external_vendor_license"],
-            }
+          # Create Android.bp
+          cat > "$VENDOR_REPO/Android.bp" << 'EOF'
+          // Automatically generated vendor blobs
+          package {
+              default_applicable_licenses: ["external_vendor_license"],
+          }
           EOF
-          fi
           
-          # Create Android.mk if it doesn't exist  
-          if [ ! -f "$VENDOR_REPO/Android.mk" ]; then
-            cat > "$VENDOR_REPO/Android.mk" << EOF
-            LOCAL_PATH := \$(call my-dir)
-            
-            ifeq (\$(TARGET_DEVICE),${{ steps.device_info.outputs.device_name }})
-            include \$(call all-subdir-makefiles,\$(LOCAL_PATH))
-            endif
+          # Create Android.mk
+          cat > "$VENDOR_REPO/Android.mk" << EOF
+          LOCAL_PATH := \$(call my-dir)
+          
+          ifeq (\$(TARGET_DEVICE),${{ steps.device_info.outputs.device_name }})
+          include \$(call all-subdir-makefiles,\$(LOCAL_PATH))
+          endif
           EOF
-          fi
           
+          # Create BoardConfigVendor.mk
+          cat > "$VENDOR_REPO/BoardConfigVendor.mk" << EOF
+          # Automatically generated vendor configuration
+          # for ${{ steps.device_info.outputs.device_name }}
+          
+          LOCAL_STEM := ${{ steps.device_info.outputs.device_name }}
+          EOF
+          
+          echo "vendor_path=$VENDOR_REPO" >> $GITHUB_ENV
           echo "Vendor repository prepared at: $VENDOR_REPO"
-
-      - name: Setup Git for pushing
-        run: |
-          git config --global user.name "$GIT_USER_NAME"
-          git config --global user.email "$GIT_USER_EMAIL"
-          git config --global init.defaultBranch main
-
-      - name: Push device tree to GitHub
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
-        run: |
-          DEVICE_REPO="android_device_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}"
-          DT_SOURCE="${{ env.DT_DIR }}/$DEVICE_REPO"
-          
-          if [ ! -d "$DT_SOURCE" ]; then
-            echo "::error::Device tree not found at $DT_SOURCE"
-            find ${{ env.DT_DIR }} -type d -maxdepth 1
-            exit 1
-          fi
-          
-          cd "$DT_SOURCE"
-          
-          # Initialize git repo
-          git init
-          git add .
-          git commit -m "Initial device tree for ${{ steps.device_info.outputs.device_name }}
-          
-          Generated from firmware: ${{ github.event.inputs.firmware_url }}
-          Device: ${{ steps.device_info.outputs.device_model }}
-          Android Version: ${{ github.event.inputs.android_version }}
-          Generated on: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          
-          Using:
-          - aospdtgen for device tree generation
-          - dumpyara for firmware extraction"
-          
-          # Create repo if it doesn't exist (using GitHub API)
-          curl -X POST \
-            -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/user/repos \
-            -d "{\"name\":\"$DEVICE_REPO\",\"private\":false,\"description\":\"Device tree for ${{ steps.device_info.outputs.device_name }} (${{ steps.device_info.outputs.device_model }})\"}" || true
-          
-          # Push to GitHub
-          git remote add origin "https://$GH_TOKEN@github.com/${{ github.repository_owner }}/$DEVICE_REPO.git" || \
-          git remote set-url origin "https://$GH_TOKEN@github.com/${{ github.repository_owner }}/$DEVICE_REPO.git"
-          
-          git push -u origin ${{ github.event.inputs.branch_name }} --force || {
-            echo "::warning::Push failed, trying with different branch name..."
-            git push -u origin HEAD:${{ github.event.inputs.branch_name }}_$(date +%s) --force
-          }
-          
-          echo "device_repo=$DEVICE_REPO" >> $GITHUB_ENV
-
-      - name: Push vendor blobs to GitHub
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
-        run: |
-          VENDOR_REPO_NAME="android_vendor_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}"
-          VENDOR_SOURCE="${{ env.VENDOR_DIR }}/$VENDOR_REPO_NAME"
-          
-          cd "$VENDOR_SOURCE"
-          
-          # Initialize git repo
-          git init
-          git add .
-          git commit -m "Initial vendor blobs for ${{ steps.device_info.outputs.device_name }}
-          
-          Extracted from firmware: ${{ github.event.inputs.firmware_url }}
-          Device: ${{ steps.device_info.outputs.device_model }}
-          Android Version: ${{ github.event.inputs.android_version }}
-          Generated on: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-          
-          # Create repo if it doesn't exist
-          curl -X POST \
-            -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/user/repos \
-            -d "{\"name\":\"$VENDOR_REPO_NAME\",\"private\":false,\"description\":\"Vendor blobs for ${{ steps.device_info.outputs.device_name }} (${{ steps.device_info.outputs.device_model }})\"}" || true
-          
-          # Push to GitHub
-          git remote add origin "https://$GH_TOKEN@github.com/${{ github.repository_owner }}/$VENDOR_REPO_NAME.git" || \
-          git remote set-url origin "https://$GH_TOKEN@github.com/${{ github.repository_owner }}/$VENDOR_REPO_NAME.git"
-          
-          git push -u origin ${{ github.event.inputs.branch_name }} --force || {
-            echo "::warning::Push failed, trying with different branch name..."
-            git push -u origin HEAD:${{ github.event.inputs.branch_name }}_$(date +%s) --force
-          }
-          
-          echo "vendor_repo=$VENDOR_REPO_NAME" >> $GITHUB_ENV
 
       - name: Generate LineageOS manifest snippet
         run: |
-          cat > ${{ env.WORK_DIR }}/manifest.xml << EOF
+          mkdir -p ${{ env.RELEASE_DIR }}
+          
+          cat > ${{ env.RELEASE_DIR }}/local_manifest.xml << EOF
           <?xml version="1.0" encoding="UTF-8"?>
-          <!-- LineageOS ${{ github.event.inputs.android_version }} Device Manifest for ${{ steps.device_info.outputs.device_name }} -->
+          <!-- 
+            LineageOS ${{ github.event.inputs.android_version }} Device Manifest 
+            for ${{ steps.device_info.outputs.device_name }} (${{ steps.device_info.outputs.device_model }})
+            
+            Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+            Stock Firmware: ${{ github.event.inputs.firmware_url }}
+            Stock Android: ${{ steps.device_info.outputs.stock_android_version }}
+            Build Fingerprint: ${{ steps.device_info.outputs.build_fingerprint }}
+          -->
           <manifest>
             
             <!-- Device tree -->
             <project path="device/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}" 
-                     name="${{ github.repository_owner }}/android_device_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}" 
+                     name="android_device_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}" 
                      remote="github" 
-                     revision="${{ github.event.inputs.branch_name }}" />
+                     revision="main" />
             
             <!-- Vendor blobs -->
             <project path="vendor/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}" 
-                     name="${{ github.repository_owner }}/android_vendor_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}" 
+                     name="android_vendor_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}" 
                      remote="github" 
-                     revision="${{ github.event.inputs.branch_name }}" />
+                     revision="main" />
             
-            <!-- Kernel (placeholder - replace with actual kernel repo) -->
-            <!-- <project path="kernel/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}" 
-                     name="${{ github.repository_owner }}/android_kernel_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}" 
-                     remote="github" 
-                     revision="main" /> -->
+            <!-- 
+              KERNEL: You need to create this repository manually or use prebuilt kernel
+              <project path="kernel/${{ github.event.inputs.device_manufacturer }}/${{ steps.device_info.outputs.device_name }}" 
+                       name="android_kernel_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}" 
+                       remote="github" 
+                       revision="main" />
+            -->
             
           </manifest>
           EOF
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: device-tree-and-vendor-${{ steps.device_info.outputs.device_name }}
-          path: |
-            ${{ env.DT_DIR }}/
-            ${{ env.VENDOR_DIR }}/
-            ${{ env.WORK_DIR }}/manifest.xml
-          retention-days: 7
-
-      - name: Create summary
+      - name: Create README files
         run: |
-          echo "## 🚀 Device Tree Generation Complete!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Device Information" >> $GITHUB_STEP_SUMMARY
-          echo "- **Device Name:** ${{ steps.device_info.outputs.device_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Device Model:** ${{ steps.device_info.outputs.device_model }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Manufacturer:** ${{ github.event.inputs.device_manufacturer }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Android Version:** ${{ github.event.inputs.android_version }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Generated Repositories" >> $GITHUB_STEP_SUMMARY
-          echo "- **Device Tree:** https://github.com/${{ github.repository_owner }}/android_device_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Vendor Blobs:** https://github.com/${{ github.repository_owner }}/android_vendor_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
-          echo "1. Clone your LineageOS source tree" >> $GITHUB_STEP_SUMMARY
-          echo "2. Add the manifest snippet to your local manifest:" >> $GITHUB_STEP_SUMMARY
-          echo '   ```bash' >> $GITHUB_STEP_SUMMARY
-          echo "   curl -o .repo/local_manifests/${{ steps.device_info.outputs.device_name }}.xml https://raw.githubusercontent.com/${{ github.repository_owner }}/${{ env.device_repo }}/${{ github.event.inputs.branch_name }}/manifest.xml" >> $GITHUB_STEP_SUMMARY
-          echo '   ```' >> $GITHUB_STEP_SUMMARY
-          echo "3. Sync the repositories:" >> $GITHUB_STEP_SUMMARY
-          echo '   ```bash' >> $GITHUB_STEP_SUMMARY
-          echo "   repo sync -c --no-clone-bundle --no-tags -j$(nproc --all)" >> $GITHUB_STEP_SUMMARY
-          echo '   ```' >> $GITHUB_STEP_SUMMARY
-          echo "4. Start the build:" >> $GITHUB_STEP_SUMMARY
-          echo '   ```bash' >> $GITHUB_STEP_SUMMARY
-          echo "   source build/envsetup.sh" >> $GITHUB_STEP_SUMMARY
-          echo "   lunch lineage_${{ steps.device_info.outputs.device_name }}-userdebug" >> $GITHUB_STEP_SUMMARY
-          echo "   mka bacon" >> $GITHUB_STEP_SUMMARY
-          echo '   ```' >> $GITHUB_STEP_SUMMARY
+          # Device Tree README
+          cat > ${{ env.dt_path }}/README.md << EOF
+          # Device Tree for ${{ steps.device_info.outputs.device_name }} (${{ steps.device_info.outputs.device_model }})
+          
+          ## Device Specifications
+          
+          | Feature | Specification |
+          |---------|--------------|
+          | Device Name | ${{ steps.device_info.outputs.device_name }} |
+          | Model | ${{ steps.device_info.outputs.device_model }} |
+          | Manufacturer | ${{ github.event.inputs.device_manufacturer }} |
+          | Stock Android | ${{ steps.device_info.outputs.stock_android_version }} |
+          | Target LineageOS | ${{ github.event.inputs.android_version }} |
+          
+          ## Build Instructions
+          
+          1. Initialize LineageOS source:
+             \`\`\`bash
+             repo init -u https://github.com/LineageOS/android.git -b lineage-${{ github.event.inputs.android_version }} --git-lfs
+             \`\`\`
+          
+          2. Create local manifest:
+             \`\`\`bash
+             mkdir -p .repo/local_manifests
+             cp local_manifest.xml .repo/local_manifests/
+             \`\`\`
+          
+          3. Sync repositories:
+             \`\`\`bash
+             repo sync -c --no-clone-bundle --no-tags -j\$(nproc --all)
+             \`\`\`
+          
+          4. Build:
+             \`\`\`bash
+             source build/envsetup.sh
+             lunch lineage_${{ steps.device_info.outputs.device_name }}-userdebug
+             mka bacon
+             \`\`\`
+          
+          ## Device Info
+          - **Build Fingerprint:** \`${{ steps.device_info.outputs.build_fingerprint }}\`
+          - **Generated:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          - **Source Firmware:** ${{ github.event.inputs.firmware_url }}
+          EOF
+          
+          # Vendor README
+          cat > ${{ env.vendor_path }}/README.md << EOF
+          # Vendor Blobs for ${{ steps.device_info.outputs.device_name }} (${{ steps.device_info.outputs.device_model }})
+          
+          ## Information
+          - **Device:** ${{ steps.device_info.outputs.device_name }}
+          - **Model:** ${{ steps.device_info.outputs.device_model }}
+          - **Extracted from:** ${{ github.event.inputs.firmware_url }}
+          - **Android Version:** ${{ steps.device_info.outputs.stock_android_version }}
+          - **Generated:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          ## Contents
+          This repository contains proprietary vendor blobs extracted from stock firmware.
+          
+          ## License
+          These blobs are proprietary and belong to their respective owners.
+          EOF
 
-      - name: Cleanup
-        if: always()
+      - name: Create release archives
+        id: create_archives
         run: |
-          rm -rf ${{ env.WORK_DIR }}/firmware/firmware.zip
-          echo "Cleanup completed"
+          mkdir -p ${{ env.RELEASE_DIR }}
+          
+          DT_NAME="android_device_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}"
+          VENDOR_NAME="android_vendor_${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          RELEASE_BASE="${{ github.event.inputs.device_manufacturer }}_${{ steps.device_info.outputs.device_name }}_${{ github.event.inputs.android_version }}_${TIMESTAMP}"
+          
+          echo "release_name=$RELEASE_BASE" >> $GITHUB_OUTPUT
+          
+          # Create ZIP archives
+          if [[ "${{ github.event.inputs.archive_format }}" == "zip" ]] || [[ "${{ github.event.inputs.archive_format }}" == "both" ]]; then
+            echo "Creating ZIP archives..."
+            
+            # Device tree ZIP
+            cd ${{ env.DT_DIR }}
+            zip -r "${{ env.RELEASE_DIR }}/${DT_NAME}.zip" "$(basename ${{ env.dt_path }})" -x "*.git*" "*.github*"
+            
+            # Vendor ZIP
+            cd ${{ env.VENDOR_DIR }}
+            zip -r "${{ env.RELEASE_DIR }}/${VENDOR_NAME}.zip" "$(basename ${{ env.vendor_path }})" -x "*.git*" "*.github*"
+            
+            # Combined ZIP
+            cd ${{ env.WORK_DIR }}
+            zip -r "${{ env.RELEASE_DIR }}/${RELEASE_BASE}_COMPLETE.zip" \
+              "${{ env.RELEASE_DIR }}/local_manifest.xml" \
+              "${{ env.DT_DIR }}/" \
+              "${{ env.VENDOR_DIR }}/" \
+              -x "*.git*" "*.github*" "*/firmware/*" "*/dumpyara/*"
+          fi
+          
+          # Create TAR.GZ archives
+          if [[ "${{ github.event.inputs.archive_format }}" == "tar.gz" ]] || [[ "${{ github.event.inputs.archive_format }}" == "both" ]]; then
+            echo "Creating TAR.GZ archives..."
+            
+            # Device tree TAR
+            cd ${{ env.DT_DIR }}
+            tar -czf "${{ env.RELEASE_DIR }}/${DT_NAME}.tar.gz" --exclude=".git" --exclude=".github" "$(basename ${{ env.dt_path }})"
+            
+            # Vendor TAR
+            cd ${{ env.VENDOR_DIR }}
+            tar -czf "${{ env.RELEASE_DIR }}/${VENDOR_NAME}.tar.gz" --exclude=".git" --exclude=".github" "$(basename ${{ env.vendor_path }})"
+            
+            # Combined TAR
+            cd ${{ env.WORK_DIR }}
+            tar -czf "${{ env.RELEASE_DIR }}/${RELEASE_BASE}_COMPLETE.tar.gz" \
+              --exclude=".git" --exclude=".github" --exclude="firmware" --exclude="dumpyara" \
+              -C ${{ env.WORK_DIR }} \
+              release/local_manifest.xml \
+              device_tree/ \
+              vendor_blobs/
+          fi
+          
+          # List created files
+          echo "Created archives:"
+          ls -lh ${{ env.RELEASE_DIR }}/
+
+      - name: Create installation script
+        run: |
+          cat > ${{ env.RELEASE_DIR }}/setup.sh << 'EOF'
           
