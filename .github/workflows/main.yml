@@ -72,9 +72,9 @@ jobs:
       - name: Extract proprietary blobs from dump
         working-directory: android/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
         run: |
-          chmod +x extract-files.sh
+          chmod +x extract-files.py
           # dumpyara_output ka absolute path do
-          ./extract-files.sh ${{ github.workspace }}/dumpyara_output/
+          ./extract-files.py ${{ github.workspace }}/dumpyara_output/
           # Ab android/vendor/ folder blobs se bhar jana chahiye
 
       # 📦 Device tree + vendor blobs dono ko package karo
