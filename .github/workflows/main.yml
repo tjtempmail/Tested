@@ -72,8 +72,10 @@ jobs:
       - name: Extract proprietary blobs from dump
         working-directory: android/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
         run: |
-          # aospdtgen ke folder ko PYTHONPATH mein add karo taake extract_utils module mil jaye
-          export PYTHONPATH="$PYTHONPATH:${{ github.workspace }}/aospdtgen"
+          # aospdtgen/src folder ko PYTHONPATH mein add karo taake extract_utils module mil jaye
+          export PYTHONPATH="${{ github.workspace }}/aospdtgen/src:$PYTHONPATH"
+          echo "PYTHONPATH set to: $PYTHONPATH"
+          
           chmod +x extract-files.py
           python extract-files.py ${{ github.workspace }}/dumpyara_output/
           # Ab android/vendor/ folder blobs se bhar jana chahiye
@@ -111,3 +113,4 @@ jobs:
             Is tar ko LineageOS source ke root mein extract karein aur `repo sync` ke baad build karein.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
