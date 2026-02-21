@@ -1,73 +1,95 @@
-name: ROM Extract and Release
+name: Generate LineageOS Device Tree (dumpyara + aospdtgen)
+
+permissions:
+  contents: write
 
 on:
   workflow_dispatch:
     inputs:
-      stock_rom_url:
-        description: 'Stock ROM URL'
+      FIRMWARE_URL:
+        description: 'Direct URL to firmware zip (stock ROM)'
         required: true
-        default: 'https://archive.org/download/infinix-hot-10i-x659b-stock-rom-firmware/R2-Infinix-Hot-10i-X659B-14.zip'
+      DEVICE_CODENAME:
+        description: 'Device codename (e.g., X659B)'
+        required: true
+      BRAND:
+        description: 'Device brand (e.g., infinix)'
+        required: true
+      MODEL:
+        description: 'Device model (e.g., Infix Hot 10i)'
+        required: true
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    
+    runs-on: ubuntu-22.04
+
     steps:
-      - name: Download Stock ROM
-        run: |
-          mkdir -p ~/Downloads
-          wget "${{ github.event.inputs.stock_rom_url }}" -O ~/Downloads/stockrom.zip
+    - name: Install system dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y python3 python3-pip wget aria2 unzip lz4 brotli p7zip-full \
+          simg2img android-sdk-libsparse-utils \
+          erofs-utils   # EROFS support ke liye (super.img ke liye)
 
-      - name: Setup Dumpyara
-        run: |
-          mkdir ~/dumpyara
-          cd ~/dumpyara
-          git clone https://github.com/AndroidDumps/dumpyara.git dumpyara-master
-          cd dumpyara-master
-          bash setup.sh
+    - name: Clone and install dumpyara
+      run: |
+        git clone https://github.com/sebaubuntu-python/dumpyara.git
+        cd dumpyara
+        pip install -e .
+        cd ..
 
-      - name: Extract Firmware
-        run: |
-          cd ~/dumpyara
-          bash ~/dumpyara/dumpyara-master/dumpyara.sh ~/Downloads/stockrom.zip || true
-          echo "All directories in ~/dumpyara:"
-          ls -la ~/dumpyara/
+    - name: Clone and install aospdtgen
+      run: |
+        git clone https://github.com/sebaubuntu-python/aospdtgen.git
+        cd aospdtgen
+        pip install -e .
+        cd ..
 
-      - name: Install aospdtgen
-        run: pip3 install aospdtgen
+    - name: Download firmware
+      run: |
+        aria2c -x 16 -s 16 -o firmware.zip "${{ github.event.inputs.FIRMWARE_URL }}"
 
-      - name: Generate Device Tree
-        run: |
-          mkdir -p ~/dumpyara/deviceTree
-          # Find the extracted firmware directory
-          FW_DIR=$(find ~/dumpyara -type d \( -name "system" -o -name "vendor" \) 2>/dev/null | head -1 | xargs dirname 2>/dev/null || echo "")
-          if [ -z "$FW_DIR" ]; then
-            FW_DIR=$(find ~/dumpyara -name "boot.img" -type f 2>/dev/null | head -1 | xargs dirname 2>/dev/null || echo "")
-          fi
-          echo "Using firmware dir: $FW_DIR"
-          if [ -n "$FW_DIR" ] && [ -d "$FW_DIR" ]; then
-            aospdtgen "$FW_DIR" -o ~/dumpyara/deviceTree
-          else
-            echo "ERROR: Could not find firmware directory"
-            exit 1
-          fi
+    # ⚠️ IMPORTANT: Directly use firmware.zip with dumpyara, no manual extraction
+    - name: Run dumpyara to create system dump
+      run: |
+        mkdir -p dumpyara_output
+        python -m dumpyara firmware.zip -o dumpyara_output/
 
-      - name: Extract Vendor Files
-        run: |
-          cd ~/dumpyara/deviceTree
-          FW_DIR=$(find ~/dumpyara -type d \( -name "system" -o -name "vendor" \) 2>/dev/null | head -1 | xargs dirname 2>/dev/null || echo "")
-          if [ -n "$FW_DIR" ]; then
-            bash extract-files.sh "$FW_DIR" || true
-          fi
+    - name: Run aospdtgen on the dump
+      run: |
+        mkdir -p device_tree
+        python -m aospdtgen dumpyara_output/ -o device_tree/
 
-      - name: Package Release
-        run: |
-          cd ~
-          tar czf release.tar.gz dumpyara/
+    - name: Extract proprietary blobs
+      run: |
+        cd device_tree
+        # Find and run extract-files.py if it exists
+        if [ -f "extract-files.py" ]; then
+          chmod +x extract-files.py
+          ./extract-files.py ../dumpyara_output/working/rom || ./extract-files.py ../dumpyara_output/
+        else
+          echo "extract-files.py not found, skipping proprietary blob extraction"
+        fi
+        cd ..
 
-      - name: Upload Release
-        uses: actions/upload-artifact@v4
-        with:
-          name: rom-extracted
-          path: ~/release.tar.gz
-          
+    - name: Package device tree
+      run: |
+        mkdir -p final/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
+        cp -r device_tree/* final/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/ 2>/dev/null || true
+        cd final
+        tar -czf ../lineage_device_tree_${{ github.event.inputs.DEVICE_CODENAME }}.tar.gz *
+        cd ..
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: lineage_device_tree_*.tar.gz
+        name: "LineageOS Device Tree for ${{ github.event.inputs.DEVICE_CODENAME }}"
+        tag_name: dt_${{ github.run_id }}
+        body: |
+          Device tree generated using **dumpyara + aospdtgen**.
+          **Device:** ${{ github.event.inputs.MODEL }} (${{ github.event.inputs.DEVICE_CODENAME }})
+          **⚠️ Auto-generated – manual fixes required:** Kernel source, proprietary blobs verification, HALs, etc.
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        
