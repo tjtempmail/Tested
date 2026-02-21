@@ -1,0 +1,112 @@
+name: Generate LineageOS Device Tree (dumpyara + aospdtgen + blobs)
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      FIRMWARE_URL:
+        description: 'Direct URL to firmware zip (stock ROM)'
+        required: true
+      DEVICE_CODENAME:
+        description: 'Device codename (e.g., X659B)'
+        required: true
+      BRAND:
+        description: 'Device brand (e.g., infinix)'
+        required: true
+      MODEL:
+        description: 'Device model (e.g., Infinix Hot 10i)'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y python3 python3-pip wget aria2 unzip lz4 brotli p7zip-full \
+            simg2img android-sdk-libsparse-utils erofs-utils
+
+      - name: Clone and install dumpyara
+        run: |
+          git clone https://github.com/sebaubuntu-python/dumpyara.git
+          cd dumpyara
+          pip install -e .
+          cd ..
+
+      - name: Clone and install aospdtgen
+        run: |
+          git clone https://github.com/sebaubuntu-python/aospdtgen.git
+          cd aospdtgen
+          pip install -e .
+          cd ..
+
+      - name: Download firmware
+        run: |
+          aria2c -x 16 -s 16 -o firmware.zip "${{ github.event.inputs.FIRMWARE_URL }}"
+
+      - name: Run dumpyara to create system dump
+        run: |
+          mkdir -p dumpyara_output
+          python -m dumpyara firmware.zip -o dumpyara_output/
+
+      - name: Run aospdtgen on the dump
+        run: |
+          mkdir -p device_tree
+          python -m aospdtgen dumpyara_output/ -o device_tree/
+
+      # 🔧 Android source tree structure banao jahan hum device tree aur vendor blobs rakh sakain
+      - name: Prepare Android source tree structure
+        run: |
+          mkdir -p android/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
+          mkdir -p android/vendor/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
+          cp -r device_tree/* android/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/
+
+      # 📥 Proprietary blobs extract karo (extract-files.sh jo aospdtgen ne banaya tha)
+      - name: Extract proprietary blobs from dump
+        working-directory: android/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
+        run: |
+          chmod +x extract-files.sh
+          # dumpyara_output ka absolute path do
+          ./extract-files.sh ${{ github.workspace }}/dumpyara_output/
+          # Ab android/vendor/ folder blobs se bhar jana chahiye
+
+      # 📦 Device tree + vendor blobs dono ko package karo
+      - name: Package full device tree with blobs
+        run: |
+          cd android
+          tar -czf ../lineage-device-full_${{ github.event.inputs.DEVICE_CODENAME }}.tar.gz device/ vendor/
+          cd ..
+
+      # ☁️ Release par upload karo
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: lineage-device-full_*.tar.gz
+          name: "LineageOS Device Tree + Blobs for ${{ github.event.inputs.DEVICE_CODENAME }}"
+          tag_name: dt_full_${{ github.run_id }}
+          body: |
+            **Auto-generated complete device tree with vendor blobs**
+            - **Device:** ${{ github.event.inputs.MODEL }} (${{ github.event.inputs.DEVICE_CODENAME }})
+            - **Brand:** ${{ github.event.inputs.BRAND }}
+            - **Firmware URL:** ${{ github.event.inputs.FIRMWARE_URL }}
+
+            ⚠️ **Manual fixes required before building:**
+            - Kernel source (add to manifest)
+            - Verify and fix HALs (hardware/libhardware, etc.)
+            - SELinux policies (currently permissive in cmdline)
+            - BoardConfig.mk me base addresses, offsets verify karein (dump se mil jayenge)
+
+            📦 **Tarball contains:**
+            - `device/` → complete device tree (BoardConfig.mk, device.mk, etc.)
+            - `vendor/` → all proprietary blobs extracted from stock ROM
+
+            Is tar ko LineageOS source ke root mein extract karein aur `repo sync` ke baad build karein.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
