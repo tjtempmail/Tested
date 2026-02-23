@@ -1,4 +1,4 @@
-name: Generate LineageOS Device Tree (dumpyara + aospdtgen)
+name: Generate LineageOS Device Tree (Production)
 
 permissions:
   contents: write
@@ -9,87 +9,461 @@ on:
       FIRMWARE_URL:
         description: 'Direct URL to firmware zip (stock ROM)'
         required: true
+        default: 'https://archive.org/download/infinix-hot-10i-x659b-stock-rom-firmware/R2-Infinix-Hot-10i-X659B-14.zip'
+        type: string
       DEVICE_CODENAME:
         description: 'Device codename (e.g., X659B)'
         required: true
+        default: 'X659B'
+        type: string
       BRAND:
-        description: 'Device brand (e.g., infinix)'
+        description: 'Device brand lowercase (e.g., infinix)'
         required: true
+        default: 'infinix'
+        type: string
       MODEL:
-        description: 'Device model (e.g., Infix Hot 10i)'
+        description: 'Device model (e.g., Infinix Hot 10i)'
         required: true
+        default: 'Infinix Hot 10i'
+        type: string
+      LINEAGE_BRANCH:
+        description: 'LineageOS branch for extract-utils'
+        required: true
+        default: 'lineage-21.0'
+        type: choice
+        options:
+          - lineage-20.0
+          - lineage-21.0
+          - lineage-22.1
 
 jobs:
-  build:
-    runs-on: ubuntu-22.04
-
+  generate-device-tree:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    
     steps:
+    - name: Maximize build space
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 512
+        swap-size-mb: 1024
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
     - name: Install system dependencies
       run: |
-        sudo apt update
-        sudo apt install -y python3 python3-pip wget aria2 unzip lz4 brotli p7zip-full \
-          simg2img android-sdk-libsparse-utils \
-          erofs-utils   # EROFS support ke liye (super.img ke liye)
+        sudo apt-get update && sudo apt-get upgrade -y
+        sudo apt-get install -y \
+          python3 python3-pip python3-venv \
+          git wget aria2 curl \
+          unzip p7zip-full p7zip-rar \
+          brotli lz4 \
+          android-sdk-libsparse-utils \
+          erofs-utils \
+          simg2img img2simg \
+          e2fsprogs \
+          cpio file rsync \
+          bc bison build-essential flex \
+          gnupg gperf libncurses5-dev \
+          libreadline-dev libsdl1.2-dev \
+          libssl-dev libxml2 libxml2-utils \
+          lzop pngcrush schedtool \
+          squashfs-tools xsltproc zip \
+          zlib1g-dev liblz4-tool \
+          cargo pkg-config
+        
+        # Install lpunpack for super.img handling
+        cargo install lpunpack || echo "lpunpack install failed, will use alternative"
 
-    - name: Clone and install dumpyara
+    - name: Setup Python environment
       run: |
-        git clone https://github.com/sebaubuntu-python/dumpyara.git
-        cd dumpyara
-        pip install -e .
-        cd ..
+        python3 -m pip install --upgrade pip setuptools wheel
+        # Install latest dumpyara and aospdtgen from PyPI
+        pip3 install dumpyara aospdtgen
+        # Verify installations
+        echo "=== Dumpyara Version ==="
+        python3 -m dumpyara --version || pip3 show dumpyara | grep Version
+        echo "=== Aospdtgen Version ==="
+        pip3 show aospdtgen | grep Version
 
-    - name: Clone and install aospdtgen
+    - name: Clone LineageOS extract-utils
       run: |
-        git clone https://github.com/sebaubuntu-python/aospdtgen.git
-        cd aospdtgen
-        pip install -e .
-        cd ..
+        mkdir -p ${{ github.workspace }}/lineage-tools
+        cd ${{ github.workspace }}/lineage-tools
+        git clone --depth=1 -b ${{ github.event.inputs.LINEAGE_BRANCH }} \
+          https://github.com/LineageOS/android_tools_extract-utils.git extract-utils
+        echo "EXTRACT_UTILS=${{ github.workspace }}/lineage-tools/extract-utils" >> $GITHUB_ENV
 
-    - name: Download firmware
+    - name: Download firmware with verification
       run: |
-        aria2c -x 16 -s 16 -o firmware.zip "${{ github.event.inputs.FIRMWARE_URL }}"
+        mkdir -p ${{ github.workspace }}/firmware
+        cd ${{ github.workspace }}/firmware
+        
+        echo "Downloading firmware from:"
+        echo "${{ github.event.inputs.FIRMWARE_URL }}"
+        
+        # Download with aria2c (fast, reliable)
+        aria2c -x 16 -s 16 --max-tries=3 --retry-wait=5 \
+          --timeout=600 --check-certificate=false \
+          -o firmware.zip "${{ github.event.inputs.FIRMWARE_URL }}"
+        
+        # Verify download
+        if [ ! -f firmware.zip ] || [ ! -s firmware.zip ]; then
+          echo "::error::Download failed or file is empty"
+          exit 1
+        fi
+        
+        FILE_SIZE=$(du -h firmware.zip | cut -f1)
+        echo "Downloaded firmware size: ${FILE_SIZE}"
+        
+        # Check file type
+        file firmware.zip
+        ls -lh firmware.zip
 
-    # ⚠️ IMPORTANT: Directly use firmware.zip with dumpyara, no manual extraction
-    - name: Run dumpyara to create system dump
+    - name: Extract firmware with dumpyara
+      id: dumpyara
       run: |
-        mkdir -p dumpyara_output
-        python -m dumpyara firmware.zip -o dumpyara_output/
+        cd ${{ github.workspace }}
+        mkdir -p dump
+        
+        echo "Starting dumpyara extraction..."
+        python3 -m dumpyara firmware/firmware.zip -o dump/ 2>&1 | tee dumpyara.log
+        
+        # Find the extracted directory (dumpyara creates timestamped subfolder)
+        DUMP_DIR=$(find dump -maxdepth 2 -type d -name "*${{ github.event.inputs.DEVICE_CODENAME }}*" | head -1)
+        
+        if [ -z "$DUMP_DIR" ]; then
+          # Fallback: find any directory in dump/
+          DUMP_DIR=$(find dump -maxdepth 1 -type d -not -path "dump" | head -1)
+        fi
+        
+        if [ -z "$DUMP_DIR" ] || [ ! -d "$DUMP_DIR" ]; then
+          echo "::error::Dumpyara failed to extract firmware properly"
+          cat dumpyara.log
+          exit 1
+        fi
+        
+        echo "DUMP_PATH=${DUMP_DIR}" >> $GITHUB_ENV
+        echo "Extraction path: ${DUMP_DIR}"
+        
+        # List extracted partitions
+        echo "Extracted partitions:"
+        ls -la ${DUMP_DIR}/ | head -30
+        
+        # Verify critical files exist
+        if [ -f "${DUMP_DIR}/system/build.prop" ]; then
+          echo "✓ system/build.prop found"
+        elif [ -f "${DUMP_DIR}/system/system/build.prop" ]; then
+          echo "✓ system/system/build.prop found (Android 10+ structure)"
+        else
+          echo "⚠ Warning: build.prop not found in expected location"
+          find ${DUMP_DIR} -name "build.prop" 2>/dev/null | head -5
+        fi
 
-    - name: Run aospdtgen on the dump
+    - name: Fix sparse images if needed
       run: |
-        mkdir -p device_tree
-        python -m aospdtgen dumpyara_output/ -o device_tree/
+        cd ${{ env.DUMP_PATH }}
+        
+        # Convert sparse super.img to raw if present
+        if [ -f "super.img" ]; then
+          IMG_TYPE=$(file super.img)
+          if echo "${IMG_TYPE}" | grep -q "sparse"; then
+            echo "Converting sparse super.img to raw..."
+            simg2img super.img super_raw.img
+            if [ -f super_raw.img ]; then
+              mv super.img super_sparse.img
+              mv super_raw.img super.img
+              echo "✓ Converted super.img from sparse to raw"
+            fi
+          fi
+        fi
+        
+        # Handle other sparse images
+        for img in system vendor product odm system_ext; do
+          if [ -f "${img}.img" ]; then
+            if file "${img}.img" | grep -q "sparse"; then
+              echo "Converting sparse ${img}.img..."
+              simg2img "${img}.img" "${img}_raw.img"
+              mv "${img}.img" "${img}_sparse.img"
+              mv "${img}_raw.img" "${img}.img"
+            fi
+          fi
+        done
+
+    - name: Generate device tree with aospdtgen
+      id: aospdtgen
+      run: |
+        cd ${{ github.workspace }}
+        mkdir -p device-tree
+        
+        echo "Running aospdtgen on ${{ env.DUMP_PATH }}..."
+        
+        # Run aospdtgen with verbose output
+        python3 -m aospdtgen "${{ env.DUMP_PATH }}" -o device-tree/ 2>&1 | tee aospdtgen.log
+        
+        # Check if generation succeeded
+        if [ ! -f "device-tree/Android.bp" ] && [ ! -f "device-tree/Android.mk" ]; then
+          echo "::error::aospdtgen failed to generate device tree files"
+          cat aospdtgen.log
+          exit 1
+        fi
+        
+        echo "✓ Device tree generated successfully"
+        find device-tree -type f | sort
+
+    - name: Create proper LineageOS device structure
+      run: |
+        BRAND="${{ github.event.inputs.BRAND }}"
+        CODENAME="${{ github.event.inputs.DEVICE_CODENAME }}"
+        
+        mkdir -p "${{ github.workspace }}/lineage-device/device/${BRAND}/${CODENAME}"
+        
+        # Copy generated files
+        cp -r ${{ github.workspace }}/device-tree/* \
+          "${{ github.workspace }}/lineage-device/device/${BRAND}/${CODENAME}/"
+        
+        # Create AndroidProducts.mk if missing
+        if [ ! -f "${{ github.workspace }}/lineage-device/device/${BRAND}/${CODENAME}/AndroidProducts.mk" ]; then
+          cat > "${{ github.workspace }}/lineage-device/device/${BRAND}/${CODENAME}/AndroidProducts.mk" << 'EOF'
+        PRODUCT_MAKEFILES := \
+            $(LOCAL_DIR)/lineage_${{ github.event.inputs.DEVICE_CODENAME }}.mk
+        EOF
+        fi
+        
+        # Create lineage.dependencies if missing
+        if [ ! -f "${{ github.workspace }}/lineage-device/device/${BRAND}/${CODENAME}/lineage.dependencies" ]; then
+          cat > "${{ github.workspace }}/lineage-device/device/${BRAND}/${CODENAME}/lineage.dependencies" << EOF
+        [
+          {
+            "repository": "android_kernel_${BRAND}_${CODENAME}",
+            "target_path": "kernel/${BRAND}/${CODENAME}"
+          },
+          {
+            "repository": "android_vendor_${BRAND}_${CODENAME}",
+            "target_path": "vendor/${BRAND}/${CODENAME}"
+          }
+        ]
+        EOF
+        fi
+        
+        # Create README
+        cat > "${{ github.workspace }}/lineage-device/device/${BRAND}/${CODENAME}/README.md" << EOF
+        # Device Tree for ${{ github.event.inputs.MODEL }} (${CODENAME})
+        
+        ## Device Specifications
+        
+        | Feature | Specification |
+        |---------|--------------|
+        | Brand | ${BRAND} |
+        | Model | ${{ github.event.inputs.MODEL }} |
+        | Codename | ${CODENAME} |
+        | Stock Android Version | Extracted from firmware |
+        
+        ## Device Tree Info
+        
+        Generated automatically using:
+        - [dumpyara](https://github.com/sebaubuntu-python/dumpyara) - Firmware extraction
+        - [aospdtgen](https://github.com/sebaubuntu-python/aospdtgen) - Device tree generation
+        - [LineageOS extract-utils](https://github.com/LineageOS/android_tools_extract-utils) - Blob extraction tools
+        
+        ## Building
+        
+        \`\`\`bash
+        source build/envsetup.sh
+        lunch lineage_${CODENAME}-userdebug
+        mka bacon
+        \`\`\`
+        
+        ## Important Notes
+        
+        **This is an auto-generated device tree. Manual verification required for:**
+        - Kernel source repository and defconfig
+        - Partition sizes in BoardConfig.mk
+        - Proprietary files list
+        - SELinux policies
+        - FSTAB configuration
+        
+        Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        Workflow Run: ${{ github.run_id }}
+        EOF
+        
+        echo "✓ Device structure created"
+        tree "${{ github.workspace }}/lineage-device/device/${BRAND}/${CODENAME}/" 2>/dev/null || \
+          find "${{ github.workspace }}/lineage-device/device/${BRAND}/${CODENAME}/" -type f | sort
 
     - name: Extract proprietary blobs
       run: |
-        cd device_tree
-        # Find and run extract-files.py if it exists
-        if [ -f "extract-files.py" ]; then
-          chmod +x extract-files.py
-          ./extract-files.py ../dumpyara_output/working/rom || ./extract-files.py ../dumpyara_output/
+        BRAND="${{ github.event.inputs.BRAND }}"
+        CODENAME="${{ github.event.inputs.DEVICE_CODENAME }}"
+        DEVICE_DIR="${{ github.workspace }}/lineage-device/device/${BRAND}/${CODENAME}"
+        
+        cd "${DEVICE_DIR}"
+        
+        # Check if extract-files.sh exists and make it executable
+        if [ -f "extract-files.sh" ]; then
+          chmod +x extract-files.sh
+          
+          # Create vendor directory structure for extraction
+          mkdir -p ${{ github.workspace }}/vendor/${BRAND}/${CODENAME}
+          
+          echo "Attempting to extract proprietary blobs..."
+          # Try to run extract-files with the dump path
+          bash extract-files.sh "${{ env.DUMP_PATH }}" 2>&1 | tee extraction.log || {
+            echo "⚠ Automatic blob extraction had issues (check extraction.log)"
+            echo "Manual extraction may be required with device connected via ADB"
+          }
+          
+          # Check if proprietary-files.txt was generated/updated
+          if [ -f "proprietary-files.txt" ]; then
+            BLOB_COUNT=$(wc -l < proprietary-files.txt)
+            echo "✓ proprietary-files.txt generated with ${BLOB_COUNT} entries"
+          fi
         else
-          echo "extract-files.py not found, skipping proprietary blob extraction"
+          echo "⚠ No extract-files.sh found - skipping blob extraction"
         fi
-        cd ..
 
-    - name: Package device tree
+    - name: Create release archives
       run: |
-        mkdir -p final/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
-        cp -r device_tree/* final/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/ 2>/dev/null || true
-        cd final
-        tar -czf ../lineage_device_tree_${{ github.event.inputs.DEVICE_CODENAME }}.tar.gz *
-        cd ..
+        BRAND="${{ github.event.inputs.BRAND }}"
+        CODENAME="${{ github.event.inputs.DEVICE_CODENAME }}"
+        
+        cd ${{ github.workspace }}
+        
+        # Create clean device tree archive
+        tar -czf "lineage_device_${CODENAME}.tar.gz" -C lineage-device/device/${BRAND} ${CODENAME}
+        
+        # Create full workspace archive (for debugging)
+        tar -czf "lineage_device_${CODENAME}_debug.tar.gz" \
+          --exclude="firmware/firmware.zip" \
+          lineage-device/ \
+          device-tree/ \
+          dumpyara.log \
+          aospdtgen.log \
+          dump/ 2>/dev/null || true
+        
+        # Generate detailed manifest
+        cat > "MANIFEST_${CODENAME}.txt" << EOF
+        LineageOS Device Tree Generation Report
+        =======================================
+        
+        Device Information:
+        - Model: ${{ github.event.inputs.MODEL }}
+        - Codename: ${CODENAME}
+        - Brand: ${BRAND}
+        - LineageOS Branch: ${{ github.event.inputs.LINEAGE_BRANCH }}
+        
+        Generation Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        Workflow Run: ${{ github.run_id }}
+        
+        Firmware Source:
+        ${{ github.event.inputs.FIRMWARE_URL }}
+        
+        Tools Used:
+        $(pip3 show dumpyara | grep -E "Name|Version")
+        $(pip3 show aospdtgen | grep -E "Name|Version")
+        extract-utils: ${{ github.event.inputs.LINEAGE_BRANCH }}
+        
+        Generated Files:
+        $(find lineage-device/device/${BRAND}/${CODENAME} -type f | wc -l) files in device tree
+        
+        Critical Files Check:
+        EOF
+        
+        # Verify critical files
+        for file in Android.bp Android.mk BoardConfig.mk device.mk; do
+          if [ -f "lineage-device/device/${BRAND}/${CODENAME}/${file}" ]; then
+            echo "- [✓] ${file}" >> MANIFEST_${CODENAME}.txt
+          else
+            echo "- [✗] ${file} (MISSING)" >> MANIFEST_${CODENAME}.txt
+          fi
+        done
+        
+        echo "" >> MANIFEST_${CODENAME}.txt
+        echo "Next Steps:" >> MANIFEST_${CODENAME}.txt
+        echo "1. Extract lineage_device_${CODENAME}.tar.gz to device/${BRAND}/${CODENAME}/" >> MANIFEST_${CODENAME}.txt
+        echo "2. Update kernel repository in lineage.dependencies" >> MANIFEST_${CODENAME}.txt
+        echo "3. Verify BoardConfig.mk partition sizes" >> MANIFEST_${CODENAME}.txt
+        echo "4. Run extract-files.sh with device connected or firmware dump" >> MANIFEST_${CODENAME}.txt
+        echo "5. Test build: lunch lineage_${CODENAME}-userdebug" >> MANIFEST_${CODENAME}.txt
+        
+        ls -lh *.tar.gz *.txt
 
-    - name: Upload to Release
+    - name: Upload to GitHub Release
       uses: softprops/action-gh-release@v2
       with:
-        files: lineage_device_tree_*.tar.gz
-        name: "LineageOS Device Tree for ${{ github.event.inputs.DEVICE_CODENAME }}"
-        tag_name: dt_${{ github.run_id }}
+        name: "LineageOS Device Tree - ${{ github.event.inputs.MODEL }} (${{ github.event.inputs.DEVICE_CODENAME }})"
+        tag_name: "${{ github.event.inputs.DEVICE_CODENAME }}-${{ github.run_number }}"
         body: |
-          Device tree generated using **dumpyara + aospdtgen**.
-          **Device:** ${{ github.event.inputs.MODEL }} (${{ github.event.inputs.DEVICE_CODENAME }})
-          **⚠️ Auto-generated – manual fixes required:** Kernel source, proprietary blobs verification, HALs, etc.
+          ## 📱 Device Tree for ${{ github.event.inputs.MODEL }}
+          
+          **Codename:** `${{ github.event.inputs.DEVICE_CODENAME }}`  
+          **Brand:** `${{ github.event.inputs.BRAND }}`  
+          **LineageOS Branch:** `${{ github.event.inputs.LINEAGE_BRANCH }}`
+          
+          ### 🔧 Generation Tools
+          - **[dumpyara](https://github.com/sebaubuntu-python/dumpyara)** - Android firmware extractor (Python)
+          - **[aospdtgen](https://github.com/sebaubuntu-python/aospdtgen)** - LineageOS device tree generator
+          - **[extract-utils](https://github.com/LineageOS/android_tools_extract-utils)** - LineageOS blob extraction tools
+          
+          ### 📦 Downloads
+          | File | Description |
+          |------|-------------|
+          | `lineage_device_${{ github.event.inputs.DEVICE_CODENAME }}.tar.gz` | **Clean device tree** - Extract to `device/${{ github.event.inputs.BRAND }}/` |
+          | `lineage_device_${{ github.event.inputs.DEVICE_CODENAME }}_debug.tar.gz` | **Full workspace** - Includes logs and dump for troubleshooting |
+          | `MANIFEST_${{ github.event.inputs.DEVICE_CODENAME }}.txt` | **Generation report** - File list and next steps |
+          
+          ### ⚠️ CRITICAL: Manual Fixes Required
+          This is an **auto-generated** device tree. Before building LineageOS, you **MUST** manually verify:
+          
+          1. **Kernel Source** - Update `TARGET_KERNEL_CONFIG` and repository path in `BoardConfig.mk`
+          2. **Partition Sizes** - Verify `BOARD_*_PARTITION_SIZE` values match your device exactly
+          3. **Proprietary Files** - Review `proprietary-files.txt` and run `extract-files.sh`
+          4. **FSTAB** - Check `rootdir/etc/fstab.*` for correct dynamic partition layout
+          5. **Dependencies** - Update `lineage.dependencies` with correct kernel/vendor repos
+          6. **SELinux** - Address any sepolicy conflicts for your Android version
+          7. **HALs** - Verify hardware abstraction layers in `device.mk`
+          
+          ### 🚀 Quick Start
+          ```bash
+          # 1. Extract to your LineageOS source
+          mkdir -p device/${{ github.event.inputs.BRAND }}/
+          tar -xzf lineage_device_${{ github.event.inputs.DEVICE_CODENAME }}.tar.gz -C device/${{ github.event.inputs.BRAND }}/
+          
+          # 2. Setup kernel (manual step - find your kernel source)
+          # vim device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/BoardConfig.mk
+          
+          # 3. Extract proprietary blobs (if not done automatically)
+          cd device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/
+          ./extract-files.sh /path/to/firmware_dump
+          
+          # 4. Build
+          source build/envsetup.sh
+          lunch lineage_${{ github.event.inputs.DEVICE_CODENAME }}-userdebug
+          mka bacon
+          ```
+          
+          ### 📝 Firmware Source
+          ```
+          ${{ github.event.inputs.FIRMWARE_URL }}
+          ```
+          
+          ---
+          *Generated by GitHub Actions* | *Run ID: ${{ github.run_id }}* | *Date: ${{ github.event.head_commit.timestamp }}*
+        files: |
+          lineage_device_${{ github.event.inputs.DEVICE_CODENAME }}.tar.gz
+          lineage_device_${{ github.event.inputs.DEVICE_CODENAME }}_debug.tar.gz
+          MANIFEST_${{ github.event.inputs.DEVICE_CODENAME }}.txt
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Cleanup
+      if: always()
+      run: |
+        # Remove firmware zip to save space and avoid caching issues
+        rm -f ${{ github.workspace }}/firmware/firmware.zip || true
+        echo "Cleanup completed"
         
