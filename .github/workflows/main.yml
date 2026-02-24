@@ -1,4 +1,4 @@
-name: Generate LineageOS Device Tree (FULL WORKING)
+name: Generate LineageOS Device Tree (Fixed & Stable)
 
 permissions:
   contents: write
@@ -21,6 +21,9 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
+    # ===============================
+    # Install Dependencies
+    # ===============================
     - name: Install dependencies
       run: |
         sudo apt update
@@ -28,6 +31,9 @@ jobs:
           simg2img lz4 brotli p7zip-full erofs-utils \
           android-sdk-libsparse-utils
 
+    # ===============================
+    # Clone Tools
+    # ===============================
     - name: Clone dumpyara
       run: |
         git clone https://github.com/sebaubuntu-python/dumpyara.git
@@ -42,55 +48,74 @@ jobs:
         pip install -e .
         cd ..
 
+    # ===============================
+    # Download Firmware
+    # ===============================
     - name: Download firmware
       run: |
         aria2c -x16 -s16 -o firmware.zip "${{ github.event.inputs.FIRMWARE_URL }}"
 
+    # ===============================
+    # Extract partitions
+    # ===============================
     - name: Extract partitions using dumpyara
       run: |
         mkdir dump
         python -m dumpyara firmware.zip -o dump/
 
-    - name: Generate device tree using aospdtgen
+    # ===============================
+    # Generate Device Tree
+    # ===============================
+    - name: Generate device tree
       run: |
         mkdir device_tree
         python -m aospdtgen dump/ -o device_tree/
 
     # ===============================
-    # PROPER BLOBS EXTRACTION
+    # Prepare Device Directory (FIXED)
     # ===============================
-    - name: Prepare vendor directory
+    - name: Prepare device directory
       run: |
-        mkdir -p vendor/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
-        cp -r device_tree/* device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/ || true
+        mkdir -p device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
+        cp -r device_tree/* device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/
 
-    - name: Copy dump into device folder (for extraction script)
-      run: |
-        mkdir -p device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/dump
-        cp -r dump/* device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/dump/
-
-    - name: Run extract-files.py (REAL extraction)
+    # ===============================
+    # Run REAL extract-files.py
+    # ===============================
+    - name: Run extract-files.py
       run: |
         cd device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
         if [ -f extract-files.py ]; then
-          python3 extract-files.py dump
+          python3 extract-files.py ../../../../dump
+        else
+          echo "No extract-files.py found"
         fi
         cd ../../../../
 
     # ===============================
-    # PACKAGE OUTPUT
+    # CLEAN LARGE FILES (IMPORTANT)
     # ===============================
-    - name: Package device + vendor tree
+    - name: Cleanup dump and images
+      run: |
+        rm -rf dump
+        find . -name "*.img" -delete || true
+        find . -name "*.dat" -delete || true
+
+    # ===============================
+    # Package ONLY device tree (Safe size)
+    # ===============================
+    - name: Package device tree
       run: |
         mkdir final
-
         mv device final/
-        mv vendor final/ || true
 
         cd final
         tar -czf ../lineage_${{ github.event.inputs.DEVICE_CODENAME }}_tree.tar.gz *
         cd ..
 
+    # ===============================
+    # Upload Release
+    # ===============================
     - name: Upload Release
       uses: softprops/action-gh-release@v2
       with:
@@ -98,7 +123,7 @@ jobs:
         tag_name: dt_${{ github.run_id }}
         name: "LineageOS Tree - ${{ github.event.inputs.DEVICE_CODENAME }}"
         body: |
-          Auto-generated tree (Device + Vendor)
+          Auto-generated device tree (SAFE SIZE)
 
           Device: ${{ github.event.inputs.MODEL }}
           Codename: ${{ github.event.inputs.DEVICE_CODENAME }}
@@ -107,10 +132,17 @@ jobs:
           - dumpyara
           - aospdtgen
 
-          ⚠ Manual fixes required:
+          Included:
+          - device tree
+          - proprietary-files.txt
+          - extract-files.py
+          - BoardConfig.mk
+
+          ⚠ Manual fixes still required:
           - Kernel source
-          - SEPolicy
-          - Hardware services
-          - RIL fixes
+          - SELinux policies
+          - RIL / IMS
+          - Camera
+          - Audio
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
