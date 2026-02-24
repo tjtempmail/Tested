@@ -56,35 +56,24 @@ jobs:
 
     - name: Run aospdtgen on the dump
       run: |
-        mkdir -p device_tree
-        python -m aospdtgen dumpyara_output/ -o device_tree/
+        mkdir -p device_tree/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
+        python -m aospdtgen dumpyara_output/ -o device_tree/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/
 
-    - name: Fix extract-files.py paths and run it
+    - name: Run extract-files.py
       run: |
-        cd device_tree
+        cd device_tree/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
         
-        # Fix hardcoded paths in extract-files.py
-        sed -i "s|/home/device|$(pwd)/device|g" extract-files.py 2>/dev/null || true
-        sed -i "s|device/infinix/X659B|.|g" extract-files.py 2>/dev/null || true
+        # Clone extract-utils to tools directory (as expected by PYTHONPATH)
+        mkdir -p ../../../../tools
+        git clone --depth=1 https://github.com/LineageOS/android_tools_extract-utils.git ../../../../tools/extract-utils
         
-        # Replace FULL-64 placeholder with actual codename
-        find . -type f \( -name "*.py" -o -name "*.sh" -o -name "*.mk" -o -name "Android.bp" \) -exec sed -i "s/FULL-64/${{ github.event.inputs.DEVICE_CODENAME }}/g" {} \; 2>/dev/null || true
-        
-        # Clone extract-utils
-        git clone --depth=1 https://github.com/LineageOS/android_tools_extract-utils.git ~/extract-utils
-        
-        # Create proper directory structure expected by extract-files.py
-        mkdir -p device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
-        cp -r * device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/ 2>/dev/null || true
-        
-        # Run extract-files.py from the correct location
-        cd device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
-        PYTHONPATH=~/extract-utils python3 extract-files.py ../../../dumpyara_output/ || true
+        # Run extract-files.py with dumpyara output
+        PYTHONPATH=../../../../tools/extract-utils python3 extract-files.py ../../../../dumpyara_output/
 
     - name: Package device tree
       run: |
-        mkdir -p final/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
-        cp -r device_tree/* final/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/ 2>/dev/null || true
+        mkdir -p final
+        cp -r device_tree/* final/
         cd final
         tar -czf ../lineage_device_tree_${{ github.event.inputs.DEVICE_CODENAME }}.tar.gz *
         cd ..
@@ -92,7 +81,7 @@ jobs:
     - name: Upload to Release
       uses: softprops/action-gh-release@v2
       with:
-        files: lineage_device_tree_*.tar.gz
+        files: lineage_device_tree_${{ github.event.inputs.DEVICE_CODENAME }}.tar.gz
         name: "LineageOS Device Tree for ${{ github.event.inputs.DEVICE_CODENAME }}"
         tag_name: dt_${{ github.run_id }}
         body: |
@@ -100,5 +89,6 @@ jobs:
           **Device:** ${{ github.event.inputs.MODEL }} (${{ github.event.inputs.DEVICE_CODENAME }})
           **⚠️ Auto-generated – manual fixes required:** Kernel source, proprietary blobs verification, HALs, etc.
       env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         
