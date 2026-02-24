@@ -16,7 +16,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-pip python3-venv git curl wget unzip
+          sudo apt-get install -y python3-pip python3-venv git curl wget unzip aria2
 
       - name: Setup and run dumpyara
         run: |
@@ -25,15 +25,14 @@ jobs:
           git clone https://github.com/AndroidDumps/dumpyara.git
           cd dumpyara
           ./setup.sh
-          wget -O firmware.zip "${{ github.event.inputs.firmware_url }}"
+          aria2c -x16 -s16 "${{ github.event.inputs.firmware_url }}" -o firmware.zip
           ./dumpyara.sh firmware.zip
 
-      - name: Find working directory and generate device tree
+      - name: Generate device tree
         run: |
           pip3 install aospdtgen
           mkdir ~/dumpyara/deviceTree
           
-          # Find the actual working subdirectory (e.g., ~/dumpyara/working/Infinix-Hot-10i-X659B-*)
           WORKING_DIR=$(find ~/dumpyara/working -maxdepth 1 -type d | tail -1)
           echo "Found working directory: $WORKING_DIR"
           
@@ -43,17 +42,13 @@ jobs:
         run: |
           cd ~/dumpyara/deviceTree
           
-          # Get codename from dumpyara output directory name
           CODENAME=$(basename $(find ~/dumpyara/working -maxdepth 1 -type d | tail -1) | grep -oP '(?<=-)[^-]+$' || echo "X659B")
           echo "Using codename: $CODENAME"
           
-          # Replace FULL-64 with actual codename
           find . -type f \( -name "*.py" -o -name "*.sh" -o -name "*.mk" -o -name "Android.bp" \) -exec sed -i "s/FULL-64/${CODENAME}/g" {} \;
           
-          # Clone extract-utils if needed
           git clone https://github.com/LineageOS/android_tools_extract-utils.git ~/extract-utils 2>/dev/null || true
           
-          # Run extract-files.py
           PYTHONPATH=~/extract-utils python3 extract-files.py "$(find ~/dumpyara/working -maxdepth 1 -type d | tail -1)"
 
       - name: Upload device tree
