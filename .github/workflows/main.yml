@@ -7,11 +7,6 @@ on:
         description: 'Direct URL to firmware ZIP file'
         required: true
         type: string
-      device_codename:
-        description: 'Device codename (e.g., X659B)'
-        required: true
-        default: 'X659B'
-        type: string
 
 jobs:
   dumpyara:
@@ -33,38 +28,43 @@ jobs:
           wget -O firmware.zip "${{ github.event.inputs.firmware_url }}"
           ./dumpyara.sh firmware.zip
 
-      - name: Generate device tree
+      - name: Find working directory and generate device tree
         run: |
           pip3 install aospdtgen
           mkdir ~/dumpyara/deviceTree
-          aospdtgen ~/dumpyara/working/* -o ~/dumpyara/deviceTree
+          
+          # Find the actual working subdirectory (e.g., ~/dumpyara/working/Infinix-Hot-10i-X659B-*)
+          WORKING_DIR=$(find ~/dumpyara/working -maxdepth 1 -type d | tail -1)
+          echo "Found working directory: $WORKING_DIR"
+          
+          aospdtgen "$WORKING_DIR" -o ~/dumpyara/deviceTree
 
-      - name: Fix extract-files.py placeholder and run it
+      - name: Fix extract-files.py and run it
         run: |
           cd ~/dumpyara/deviceTree
-          # Replace FULL-64 with actual codename
-          sed -i 's/FULL-64/${{ github.event.inputs.device_codename }}/g' extract-files.py
-          sed -i 's/FULL-64/${{ github.event.inputs.device_codename }}/g' setup-makefiles.sh 2>/dev/null || true
-          sed -i 's/FULL-64/${{ github.event.inputs.device_codename }}/g' Android.bp 2>/dev/null || true
-          sed -i 's/FULL-64/${{ github.event.inputs.device_codename }}/g' Android.mk 2>/dev/null || true
-          sed -i 's/FULL-64/${{ github.event.inputs.device_codename }}/g' BoardConfig.mk 2>/dev/null || true
-          sed -i 's/FULL-64/${{ github.event.inputs.device_codename }}/g' device.mk 2>/dev/null || true
           
-          # Create vendor directory structure
-          mkdir -p ~/android/lineage/vendor/infinix/${{ github.event.inputs.device_codename }}
+          # Get codename from dumpyara output directory name
+          CODENAME=$(basename $(find ~/dumpyara/working -maxdepth 1 -type d | tail -1) | grep -oP '(?<=-)[^-]+$' || echo "X659B")
+          echo "Using codename: $CODENAME"
+          
+          # Replace FULL-64 with actual codename
+          find . -type f \( -name "*.py" -o -name "*.sh" -o -name "*.mk" -o -name "Android.bp" \) -exec sed -i "s/FULL-64/${CODENAME}/g" {} \;
+          
+          # Clone extract-utils if needed
+          git clone https://github.com/LineageOS/android_tools_extract-utils.git ~/extract-utils 2>/dev/null || true
           
           # Run extract-files.py
-          python3 extract-files.py ~/dumpyara/working/*
+          PYTHONPATH=~/extract-utils python3 extract-files.py "$(find ~/dumpyara/working -maxdepth 1 -type d | tail -1)"
 
       - name: Upload device tree
         uses: actions/upload-artifact@v4
         with:
-          name: device-tree-${{ github.event.inputs.device_codename }}
+          name: device-tree
           path: ~/dumpyara/deviceTree/
 
       - name: Upload vendor blobs
         uses: actions/upload-artifact@v4
         with:
-          name: vendor-blobs-${{ github.event.inputs.device_codename }}
-          path: ~/android/lineage/vendor/infinix/
+          name: vendor-blobs
+          path: ~/dumpyara/deviceTree/vendor/
           
