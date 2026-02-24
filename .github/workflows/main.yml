@@ -16,7 +16,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-pip python3-venv git curl wget unzip aria2
+          sudo apt-get install -y python3-pip python3-venv git curl wget unzip aria2 erofs-utils
 
       - name: Install dumpyara via pip
         run: |
