@@ -49,7 +49,8 @@ jobs:
           pip3 install aospdtgen
           mkdir ~/dumpyara/deviceTree
           
-          WORKING_DIR=$(find ~/dumpyara/working -maxdepth 1 -type d | tail -1)
+          # pip dumpyara uses 'firmware' not 'working'
+          WORKING_DIR=~/dumpyara/firmware
           echo "Found working directory: $WORKING_DIR"
           
           aospdtgen "$WORKING_DIR" -o ~/dumpyara/deviceTree
@@ -58,14 +59,15 @@ jobs:
         run: |
           cd ~/dumpyara/deviceTree
           
-          CODENAME=$(basename $(find ~/dumpyara/working -maxdepth 1 -type d | tail -1) | grep -oP '(?<=-)[^-]+$' || echo "X659B")
+          # Get codename from dumpyara output
+          CODENAME=$(basename ~/dumpyara/firmware/boot/ 2>/dev/null | head -1 || echo "X659B")
           echo "Using codename: $CODENAME"
           
           find . -type f \( -name "*.py" -o -name "*.sh" -o -name "*.mk" -o -name "Android.bp" \) -exec sed -i "s/FULL-64/${CODENAME}/g" {} \;
           
           git clone https://github.com/LineageOS/android_tools_extract-utils.git ~/extract-utils 2>/dev/null || true
           
-          PYTHONPATH=~/extract-utils python3 extract-files.py "$(find ~/dumpyara/working -maxdepth 1 -type d | tail -1)"
+          PYTHONPATH=~/extract-utils python3 extract-files.py ~/dumpyara/firmware
 
       - name: Upload device tree
         uses: actions/upload-artifact@v4
