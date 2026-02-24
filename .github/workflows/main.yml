@@ -18,15 +18,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y python3-pip python3-venv git curl wget unzip aria2
 
-      - name: Setup and run dumpyara
+      - name: Install dumpyara via pip
+        run: |
+          pip3 install dumpyara
+
+      - name: Download firmware and run dumpyara
         run: |
           mkdir ~/dumpyara
           cd ~/dumpyara
-          git clone https://github.com/AndroidDumps/dumpyara.git
-          cd dumpyara
-          ./setup.sh
           aria2c -x16 -s16 "${{ github.event.inputs.firmware_url }}" -o firmware.zip
-          ./dumpyara.sh firmware.zip
+          dumpyara firmware.zip || true
 
       - name: Generate device tree
         run: |
