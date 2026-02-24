@@ -59,16 +59,23 @@ jobs:
         mkdir -p device_tree/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
         python -m aospdtgen dumpyara_output/ -o device_tree/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/
 
-    - name: Run extract-files.py
+    - name: Fix extract-files.py paths and run it
       run: |
         cd device_tree/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
+        
+        # Fix the hardcoded paths in extract-files.py
+        # Change 'device/infinix/FULL-64' to current directory structure
+        sed -i "s|device/infinix/FULL-64|device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}|g" extract-files.py
+        sed -i "s|device/infinix|device/${{ github.event.inputs.BRAND }}|g" extract-files.py
+        sed -i "s|FULL-64|${{ github.event.inputs.DEVICE_CODENAME }}|g" extract-files.py
         
         # Clone extract-utils to tools directory (as expected by PYTHONPATH)
         mkdir -p ../../../../tools
         git clone --depth=1 https://github.com/LineageOS/android_tools_extract-utils.git ../../../../tools/extract-utils
         
-        # Run extract-files.py with dumpyara output
-        PYTHONPATH=../../../../tools/extract-utils python3 extract-files.py ../../../../dumpyara_output/
+        # Go to repo root and run from there (as extract-files.py expects)
+        cd ../../../../
+        PYTHONPATH=tools/extract-utils python3 device_tree/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/extract-files.py dumpyara_output/
 
     - name: Package device tree
       run: |
