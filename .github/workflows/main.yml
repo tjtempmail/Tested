@@ -1,83 +1,96 @@
-name: Dumpyara and Device Tree Generation
+name: Generate LineageOS Device Tree (dumpyara + aospdtgen)
+
+permissions:
+  contents: write
 
 on:
   workflow_dispatch:
     inputs:
-      firmware_url:
-        description: 'Direct URL to firmware ZIP file'
+      FIRMWARE_URL:
+        description: 'Direct URL to firmware zip (stock ROM)'
         required: true
-        type: string
+      DEVICE_CODENAME:
+        description: 'Device codename (e.g., X659B)'
+        required: true
+      BRAND:
+        description: 'Device brand (e.g., infinix)'
+        required: true
+      MODEL:
+        description: 'Device model (e.g., Infinix Hot 10i)'
+        required: true
 
 jobs:
-  dumpyara:
-    runs-on: ubuntu-latest
-    
+  build:
+    runs-on: ubuntu-22.04
+
     steps:
-      - name: Install all dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            python3-pip \
-            python3-venv \
-            git \
-            curl \
-            wget \
-            unzip \
-            aria2 \
-            erofs-utils \
-            android-sdk-libsparse-utils \
-            liblz4-tool \
-            brotli \
-            p7zip-full \
-            unace \
-            unrar \
-            xz-utils
+    - name: Install system dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y python3 python3-pip wget aria2 unzip lz4 brotli p7zip-full \
+          simg2img android-sdk-libsparse-utils \
+          erofs-utils
 
-      - name: Install dumpyara via pip
-        run: |
-          pip3 install dumpyara
+    - name: Clone and install dumpyara
+      run: |
+        git clone https://github.com/sebaubuntu-python/dumpyara.git
+        cd dumpyara
+        pip install -e .
+        cd ..
 
-      - name: Download firmware and run dumpyara
-        run: |
-          mkdir ~/dumpyara
-          cd ~/dumpyara
-          aria2c -x16 -s16 "${{ github.event.inputs.firmware_url }}" -o firmware.zip
-          dumpyara firmware.zip || true
+    - name: Clone and install aospdtgen
+      run: |
+        git clone https://github.com/sebaubuntu-python/aospdtgen.git
+        cd aospdtgen
+        pip install -e .
+        cd ..
 
-      - name: Generate device tree
-        run: |
-          pip3 install aospdtgen
-          mkdir ~/dumpyara/deviceTree
-          
-          # pip dumpyara uses 'firmware' not 'working'
-          WORKING_DIR=~/dumpyara/firmware
-          echo "Found working directory: $WORKING_DIR"
-          
-          aospdtgen "$WORKING_DIR" -o ~/dumpyara/deviceTree
+    - name: Download firmware
+      run: |
+        aria2c -x 16 -s 16 -o firmware.zip "${{ github.event.inputs.FIRMWARE_URL }}"
 
-      - name: Fix extract-files.py and run it
-        run: |
-          cd ~/dumpyara/deviceTree
-          
-          # Get codename from dumpyara output
-          CODENAME=$(basename ~/dumpyara/firmware/boot/ 2>/dev/null | head -1 || echo "X659B")
-          echo "Using codename: $CODENAME"
-          
-          find . -type f \( -name "*.py" -o -name "*.sh" -o -name "*.mk" -o -name "Android.bp" \) -exec sed -i "s/FULL-64/${CODENAME}/g" {} \;
-          
-          git clone https://github.com/LineageOS/android_tools_extract-utils.git ~/extract-utils 2>/dev/null || true
-          
-          PYTHONPATH=~/extract-utils python3 extract-files.py ~/dumpyara/firmware
+    - name: Run dumpyara to create system dump
+      run: |
+        mkdir -p dumpyara_output
+        python -m dumpyara firmware.zip -o dumpyara_output/
 
-      - name: Upload device tree
-        uses: actions/upload-artifact@v4
-        with:
-          name: device-tree
-          path: ~/dumpyara/deviceTree/
+    - name: Run aospdtgen on the dump
+      run: |
+        mkdir -p device_tree
+        python -m aospdtgen dumpyara_output/ -o device_tree/
 
-      - name: Upload vendor blobs
-        uses: actions/upload-artifact@v4
-        with:
-          name: vendor-blobs
-          path: ~/dumpyara/deviceTree/vendor/
-          
+    - name: Fix extract-files.py and run it
+      run: |
+        cd device_tree
+        
+        # Replace FULL-64 placeholder with actual codename
+        find . -name "extract-files.py" -exec sed -i "s/FULL-64/${{ github.event.inputs.DEVICE_CODENAME }}/g" {} \;
+        find . -name "*.sh" -o -name "*.mk" -o -name "Android.bp" 2>/dev/null | xargs sed -i "s/FULL-64/${{ github.event.inputs.DEVICE_CODENAME }}/g" 2>/dev/null || true
+        
+        # Clone extract-utils
+        git clone --depth=1 https://github.com/LineageOS/android_tools_extract-utils.git ~/extract-utils
+        
+        # Run extract-files.py to extract proprietary blobs
+        PYTHONPATH=~/extract-utils python3 extract-files.py ../dumpyara_output/
+
+    - name: Package device tree
+      run: |
+        mkdir -p final/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
+        cp -r device_tree/* final/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/ 2>/dev/null || true
+        cd final
+        tar -czf ../lineage_device_tree_${{ github.event.inputs.DEVICE_CODENAME }}.tar.gz *
+        cd ..
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: lineage_device_tree_*.tar.gz
+        name: "LineageOS Device Tree for ${{ github.event.inputs.DEVICE_CODENAME }}"
+        tag_name: dt_${{ github.run_id }}
+        body: |
+          Device tree generated using **dumpyara + aospdtgen**.
+          **Device:** ${{ github.event.inputs.MODEL }} (${{ github.event.inputs.DEVICE_CODENAME }})
+          **⚠️ Auto-generated – manual fixes required:** Kernel source, proprietary blobs verification, HALs, etc.
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        
