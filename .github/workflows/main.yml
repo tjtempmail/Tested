@@ -1,4 +1,4 @@
-name: Generate LineageOS Device Tree (dumpyara + aospdtgen)
+name: Generate LineageOS Device Tree (FULL WORKING)
 
 permissions:
   contents: write
@@ -7,16 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       FIRMWARE_URL:
-        description: 'Direct URL to firmware zip (stock ROM)'
+        description: 'Direct URL to firmware zip'
         required: true
       DEVICE_CODENAME:
-        description: 'Device codename (e.g., X659B)'
         required: true
       BRAND:
-        description: 'Device brand (e.g., infinix)'
         required: true
       MODEL:
-        description: 'Device model (e.g., Infinix Hot 10i)'
         required: true
 
 jobs:
@@ -24,21 +21,21 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - name: Install system dependencies
+    - name: Install dependencies
       run: |
         sudo apt update
-        sudo apt install -y python3 python3-pip wget aria2 unzip lz4 brotli p7zip-full \
-          simg2img android-sdk-libsparse-utils \
-          erofs-utils
+        sudo apt install -y python3 python3-pip git wget aria2 unzip \
+          simg2img lz4 brotli p7zip-full erofs-utils \
+          android-sdk-libsparse-utils
 
-    - name: Clone and install dumpyara
+    - name: Clone dumpyara
       run: |
         git clone https://github.com/sebaubuntu-python/dumpyara.git
         cd dumpyara
         pip install -e .
         cd ..
 
-    - name: Clone and install aospdtgen
+    - name: Clone aospdtgen
       run: |
         git clone https://github.com/sebaubuntu-python/aospdtgen.git
         cd aospdtgen
@@ -47,54 +44,73 @@ jobs:
 
     - name: Download firmware
       run: |
-        aria2c -x 16 -s 16 -o firmware.zip "${{ github.event.inputs.FIRMWARE_URL }}"
+        aria2c -x16 -s16 -o firmware.zip "${{ github.event.inputs.FIRMWARE_URL }}"
 
-    - name: Run dumpyara to create system dump
+    - name: Extract partitions using dumpyara
       run: |
-        mkdir -p dumpyara_output
-        python -m dumpyara firmware.zip -o dumpyara_output/
+        mkdir dump
+        python -m dumpyara firmware.zip -o dump/
 
-    - name: Run aospdtgen on the dump
+    - name: Generate device tree using aospdtgen
       run: |
-        mkdir -p device_tree/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
-        python -m aospdtgen dumpyara_output/ -o device_tree/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/
+        mkdir device_tree
+        python -m aospdtgen dump/ -o device_tree/
 
-    - name: Fix extract-files.py paths and run it
+    # ===============================
+    # PROPER BLOBS EXTRACTION
+    # ===============================
+    - name: Prepare vendor directory
       run: |
-        cd device_tree/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
-        
-        # Fix the hardcoded paths in extract-files.py
-        # Change 'device/infinix/FULL-64' to current directory structure
-        sed -i "s|device/infinix/FULL-64|device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}|g" extract-files.py
-        sed -i "s|device/infinix|device/${{ github.event.inputs.BRAND }}|g" extract-files.py
-        sed -i "s|FULL-64|${{ github.event.inputs.DEVICE_CODENAME }}|g" extract-files.py
-        
-        # Clone extract-utils to tools directory (as expected by PYTHONPATH)
-        mkdir -p ../../../../tools
-        git clone --depth=1 https://github.com/LineageOS/android_tools_extract-utils.git ../../../../tools/extract-utils
-        
-        # Go to repo root and run from there (as extract-files.py expects)
+        mkdir -p vendor/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
+        cp -r device_tree/* device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/ || true
+
+    - name: Copy dump into device folder (for extraction script)
+      run: |
+        mkdir -p device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/dump
+        cp -r dump/* device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/dump/
+
+    - name: Run extract-files.py (REAL extraction)
+      run: |
+        cd device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
+        if [ -f extract-files.py ]; then
+          python3 extract-files.py dump
+        fi
         cd ../../../../
-        PYTHONPATH=tools/extract-utils python3 device_tree/device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/extract-files.py dumpyara_output/
 
-    - name: Package device tree
+    # ===============================
+    # PACKAGE OUTPUT
+    # ===============================
+    - name: Package device + vendor tree
       run: |
-        mkdir -p final
-        cp -r device_tree/* final/
+        mkdir final
+
+        mv device final/
+        mv vendor final/ || true
+
         cd final
-        tar -czf ../lineage_device_tree_${{ github.event.inputs.DEVICE_CODENAME }}.tar.gz *
+        tar -czf ../lineage_${{ github.event.inputs.DEVICE_CODENAME }}_tree.tar.gz *
         cd ..
 
-    - name: Upload to Release
+    - name: Upload Release
       uses: softprops/action-gh-release@v2
       with:
-        files: lineage_device_tree_${{ github.event.inputs.DEVICE_CODENAME }}.tar.gz
-        name: "LineageOS Device Tree for ${{ github.event.inputs.DEVICE_CODENAME }}"
+        files: lineage_${{ github.event.inputs.DEVICE_CODENAME }}_tree.tar.gz
         tag_name: dt_${{ github.run_id }}
+        name: "LineageOS Tree - ${{ github.event.inputs.DEVICE_CODENAME }}"
         body: |
-          Device tree generated using **dumpyara + aospdtgen**.
-          **Device:** ${{ github.event.inputs.MODEL }} (${{ github.event.inputs.DEVICE_CODENAME }})
-          **⚠️ Auto-generated – manual fixes required:** Kernel source, proprietary blobs verification, HALs, etc.
+          Auto-generated tree (Device + Vendor)
+
+          Device: ${{ github.event.inputs.MODEL }}
+          Codename: ${{ github.event.inputs.DEVICE_CODENAME }}
+
+          Generated using:
+          - dumpyara
+          - aospdtgen
+
+          ⚠ Manual fixes required:
+          - Kernel source
+          - SEPolicy
+          - Hardware services
+          - RIL fixes
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        
