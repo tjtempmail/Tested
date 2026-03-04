@@ -1,148 +1,96 @@
-name: Generate LineageOS Device Tree (Fixed & Stable)
-
-permissions:
-  contents: write
+name: Download Android GSI and Release
 
 on:
   workflow_dispatch:
-    inputs:
-      FIRMWARE_URL:
-        description: 'Direct URL to firmware zip'
-        required: true
-      DEVICE_CODENAME:
-        required: true
-      BRAND:
-        required: true
-      MODEL:
-        required: true
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly check (Sundays at midnight UTC)
+
+env:
+  FILENAME: aosp_arm64-exp-CP21.260206.011-14911669-04f2dce1.zip
+  DOWNLOAD_URL: https://dl.google.com/developers/android/cinnamonbun/images/gsi/aosp_arm64-exp-CP21.260206.011-14911669-04f2dce1.zip
 
 jobs:
-  build:
-    runs-on: ubuntu-22.04
-
+  download-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
     steps:
-    # ===============================
-    # Install Dependencies
-    # ===============================
-    - name: Install dependencies
-      run: |
-        sudo apt update
-        sudo apt install -y python3 python3-pip git wget aria2 unzip \
-          simg2img lz4 brotli p7zip-full erofs-utils \
-          android-sdk-libsparse-utils
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    # ===============================
-    # Clone Tools
-    # ===============================
-    - name: Clone dumpyara
-      run: |
-        git clone https://github.com/sebaubuntu-python/dumpyara.git
-        cd dumpyara
-        pip install -e .
-        cd ..
+      - name: Download Android GSI
+        run: |
+          echo "Downloading Android 17 GSI (Cinnamonbun)..."
+          echo "URL: ${{ env.DOWNLOAD_URL }}"
+          
+          # Download with curl (follow redirects, resume support, progress bar)
+          curl -L -C - -o "${{ env.FILENAME }}" "${{ env.DOWNLOAD_URL }}" --progress-bar
+          
+          # Verify file was downloaded
+          if [ ! -f "${{ env.FILENAME }}" ]; then
+            echo "Error: Download failed"
+            exit 1
+          fi
+          
+          # Get file size
+          FILE_SIZE=$(du -h "${{ env.FILENAME }}" | cut -f1)
+          echo "Downloaded successfully: ${{ env.FILENAME }} ($FILE_SIZE)"
+          
+          # Calculate SHA256 checksum
+          echo "Calculating SHA256 checksum..."
+          sha256sum "${{ env.FILENAME }}" > checksum.txt
+          cat checksum.txt
 
-    - name: Clone aospdtgen
-      run: |
-        git clone https://github.com/sebaubuntu-python/aospdtgen.git
-        cd aospdtgen
-        pip install -e .
-        cd ..
+      - name: Generate Release Notes
+        run: |
+          cat > release_notes.md << 'EOF'
+          # Android 17 GSI (Cinnamonbun) - Experimental Build
+          
+          **Build:** CP21.260206.011  
+          **Date:** February 2025  
+          **Architecture:** ARM64  
+          **Type:** AOSP Experimental GSI (Generic System Image)
+          
+          ## File Details
+          - **Filename:** `${{ env.FILENAME }}`
+          - **Source:** Google Developers CDN
+          - **Codename:** Cinnamonbun (Android 17)
+          
+          ## Description
+          This is an experimental Android 17 Generic System Image (GSI) for ARM64 devices. 
+          GSIs are used for app testing and validation on Treble-compliant devices.
+          
+          ## Requirements
+          - Device must support Treble (launched with Android 9+)
+          - Unlocked bootloader
+          - ARM64 architecture
+          
+          ## Installation Warning
+          ⚠️ **Experimental Build**: This is a developer preview and may contain bugs.
+          Always backup your data before flashing. Not recommended for daily driver use.
+          
+          ## Checksum
+          SHA256 checksum is provided in the release assets for verification.
+          
+          ## Source
+          Downloaded from: `${{ env.DOWNLOAD_URL }}`
+          
+          ---
+          *Automatically downloaded and published via GitHub Actions*
+          EOF
 
-    # ===============================
-    # Download Firmware
-    # ===============================
-    - name: Download firmware
-      run: |
-        aria2c -x16 -s16 -o firmware.zip "${{ github.event.inputs.FIRMWARE_URL }}"
-
-    # ===============================
-    # Extract partitions
-    # ===============================
-    - name: Extract partitions using dumpyara
-      run: |
-        mkdir dump
-        python -m dumpyara firmware.zip -o dump/
-
-    # ===============================
-    # Generate Device Tree
-    # ===============================
-    - name: Generate device tree
-      run: |
-        mkdir device_tree
-        python -m aospdtgen dump/ -o device_tree/
-
-    # ===============================
-    # Prepare Device Directory (FIXED)
-    # ===============================
-    - name: Prepare device directory
-      run: |
-        mkdir -p device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
-        cp -r device_tree/* device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}/
-
-    # ===============================
-    # Run REAL extract-files.py
-    # ===============================
-    - name: Run extract-files.py
-      run: |
-        cd device/${{ github.event.inputs.BRAND }}/${{ github.event.inputs.DEVICE_CODENAME }}
-        if [ -f extract-files.py ]; then
-          python3 extract-files.py ../../../../dump
-        else
-          echo "No extract-files.py found"
-        fi
-        cd ../../../../
-
-    # ===============================
-    # CLEAN LARGE FILES (IMPORTANT)
-    # ===============================
-    - name: Cleanup dump and images
-      run: |
-        rm -rf dump
-        find . -name "*.img" -delete || true
-        find . -name "*.dat" -delete || true
-
-    # ===============================
-    # Package ONLY device tree (Safe size)
-    # ===============================
-    - name: Package device tree
-      run: |
-        mkdir final
-        mv device final/
-
-        cd final
-        tar -czf ../lineage_${{ github.event.inputs.DEVICE_CODENAME }}_tree.tar.gz *
-        cd ..
-
-    # ===============================
-    # Upload Release
-    # ===============================
-    - name: Upload Release
-      uses: softprops/action-gh-release@v2
-      with:
-        files: lineage_${{ github.event.inputs.DEVICE_CODENAME }}_tree.tar.gz
-        tag_name: dt_${{ github.run_id }}
-        name: "LineageOS Tree - ${{ github.event.inputs.DEVICE_CODENAME }}"
-        body: |
-          Auto-generated device tree (SAFE SIZE)
-
-          Device: ${{ github.event.inputs.MODEL }}
-          Codename: ${{ github.event.inputs.DEVICE_CODENAME }}
-
-          Generated using:
-          - dumpyara
-          - aospdtgen
-
-          Included:
-          - device tree
-          - proprietary-files.txt
-          - extract-files.py
-          - BoardConfig.mk
-
-          ⚠ Manual fixes still required:
-          - Kernel source
-          - SELinux policies
-          - RIL / IMS
-          - Camera
-          - Audio
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: android-17-gsi-${{ github.run_number }}
+          name: "Android 17 GSI - CP21.260206.011 (Build ${{ github.run_number }})"
+          body_path: release_notes.md
+          files: |
+            ${{ env.FILENAME }}
+            checksum.txt
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
