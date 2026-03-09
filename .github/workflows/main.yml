@@ -1,96 +1,189 @@
-name: Download Android GSI and Release
+name: Unpack Vendor Boot Image
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * 0'  # Weekly check (Sundays at midnight UTC)
-
-env:
-  FILENAME: aosp_arm64-exp-CP21.260206.011-14911669-04f2dce1.zip
-  DOWNLOAD_URL: https://dl.google.com/developers/android/cinnamonbun/images/gsi/aosp_arm64-exp-CP21.260206.011-14911669-04f2dce1.zip
+  workflow_dispatch:  # Manual trigger
+    inputs:
+      image_url:
+        description: 'URL to vendor_boot.img'
+        required: true
+        default: 'https://archive.org/download/vendor_boot_202603/vendor_boot.img'
+      upload_artifacts:
+        description: 'Upload unpacked contents as artifacts'
+        required: true
+        default: true
+        type: boolean
 
 jobs:
-  download-and-release:
+  unpack-vendor-boot:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download Android GSI
+      - name: Install dependencies
         run: |
-          echo "Downloading Android 17 GSI (Cinnamonbun)..."
-          echo "URL: ${{ env.DOWNLOAD_URL }}"
+          sudo apt-get update
+          sudo apt-get install -y \
+            wget \
+            xz-utils \
+            lz4 \
+            gzip \
+            cpio \
+            file \
+            p7zip-full \
+            android-sdk-libsparse-utils \
+            liblz4-tool
+
+      - name: Download magiskboot binary
+        run: |
+          # Download latest magiskboot from Magisk releases
+          MAGISK_URL=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest | \
+            grep "browser_download_url.*Magisk.*apk" | cut -d '"' -f 4)
           
-          # Download with curl (follow redirects, resume support, progress bar)
-          curl -L -C - -o "${{ env.FILENAME }}" "${{ env.DOWNLOAD_URL }}" --progress-bar
+          # Alternative: Use direct link to magiskboot binary
+          wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O magisk.zip || \
+          wget -q https://github.com/topjohnwu/Magisk/releases/download/v26.4/Magisk-v26.4.apk -O magisk.zip
           
-          # Verify file was downloaded
-          if [ ! -f "${{ env.FILENAME }}" ]; then
-            echo "Error: Download failed"
-            exit 1
+          unzip -o magisk.zip -d magisk_extracted || true
+          
+          # Find magiskboot binary (might be in assets)
+          find magisk_extracted -name "magiskboot" -type f -exec cp {} ./magiskboot \; || true
+          
+          # If not found, try extracting from lib
+          if [ ! -f ./magiskboot ]; then
+            # Download prebuilt magiskboot for x86_64
+            wget -q "https://raw.githubusercontent.com/topjohnwu/Magisk/master/native/src/boot/magiskboot.cpp" -O /dev/null || true
+            # Fallback: compile or use alternative source
+            echo "Attempting alternative download method..."
+            wget -q https://github.com/carlodandan/Patch-Recovery-VB/raw/main/bin/magiskboot -O magiskboot || \
+            wget -q https://github.com/osm0sis/Android-Image-Kitchen/raw/master/android_image_kit.sh -O aik.sh
           fi
           
-          # Get file size
-          FILE_SIZE=$(du -h "${{ env.FILENAME }}" | cut -f1)
-          echo "Downloaded successfully: ${{ env.FILENAME }} ($FILE_SIZE)"
-          
-          # Calculate SHA256 checksum
-          echo "Calculating SHA256 checksum..."
-          sha256sum "${{ env.FILENAME }}" > checksum.txt
-          cat checksum.txt
+          if [ -f ./magiskboot ]; then
+            chmod +x ./magiskboot
+            echo "Magiskboot ready"
+          fi
 
-      - name: Generate Release Notes
+      - name: Download vendor_boot.img
         run: |
-          cat > release_notes.md << 'EOF'
-          # Android 17 GSI (Cinnamonbun) - Experimental Build
+          URL="${{ github.event.inputs.image_url }}"
+          echo "Downloading from: $URL"
+          wget --progress=bar:force -O vendor_boot.img "$URL"
           
-          **Build:** CP21.260206.011  
-          **Date:** February 2025  
-          **Architecture:** ARM64  
-          **Type:** AOSP Experimental GSI (Generic System Image)
-          
-          ## File Details
-          - **Filename:** `${{ env.FILENAME }}`
-          - **Source:** Google Developers CDN
-          - **Codename:** Cinnamonbun (Android 17)
-          
-          ## Description
-          This is an experimental Android 17 Generic System Image (GSI) for ARM64 devices. 
-          GSIs are used for app testing and validation on Treble-compliant devices.
-          
-          ## Requirements
-          - Device must support Treble (launched with Android 9+)
-          - Unlocked bootloader
-          - ARM64 architecture
-          
-          ## Installation Warning
-          ⚠️ **Experimental Build**: This is a developer preview and may contain bugs.
-          Always backup your data before flashing. Not recommended for daily driver use.
-          
-          ## Checksum
-          SHA256 checksum is provided in the release assets for verification.
-          
-          ## Source
-          Downloaded from: `${{ env.DOWNLOAD_URL }}`
-          
-          ---
-          *Automatically downloaded and published via GitHub Actions*
-          EOF
+          # Verify download
+          ls -lh vendor_boot.img
+          file vendor_boot.img
 
-      - name: Create GitHub Release
+      - name: Unpack vendor_boot.img using magiskboot
+        if: hashFiles('magiskboot') != ''
+        run: |
+          mkdir -p unpacked_vendor_boot
+          cd unpacked_vendor_boot
+          
+          # Unpack the vendor_boot image
+          ../magiskboot unpack ../vendor_boot.img
+          
+          echo "Unpacking completed. Contents:"
+          ls -lah
+
+      - name: Alternative: Unpack using Android Image Kitchen
+        if: hashFiles('magiskboot') == ''
+        run: |
+          # Clone AIK if magiskboot not available
+          git clone --depth 1 https://github.com/osm0sis/Android-Image-Kitchen.git AIK
+          cd AIK
+          
+          # Move image to AIK directory
+          mv ../vendor_boot.img ./
+          
+          # Unpack
+          bash unpackimg.sh ./vendor_boot.img
+          
+          # Move results back
+          mkdir -p ../unpacked_vendor_boot
+          mv split_img ../unpacked_vendor_boot/ || true
+          mv ramdisk ../unpacked_vendor_boot/ || true
+
+      - name: Extract ramdisk contents (if present)
+        run: |
+          cd unpacked_vendor_boot
+          
+          # Check for ramdisk files
+          if [ -f "ramdisk.cpio" ]; then
+            echo "Found ramdisk.cpio, extracting..."
+            mkdir -p ramdisk_extracted
+            cd ramdisk_extracted
+            
+            # Extract cpio archive
+            ../magiskboot cpio ../ramdisk.cpio extract || \
+            (cpio -i < ../ramdisk.cpio 2>/dev/null || true)
+            
+            cd ..
+          fi
+          
+          if [ -f "vendor_ramdisk.cpio" ]; then
+            echo "Found vendor_ramdisk.cpio, extracting..."
+            mkdir -p vendor_ramdisk_extracted
+            cd vendor_ramdisk_extracted
+            
+            # Try magiskboot first, then standard cpio
+            ../magiskboot cpio ../vendor_ramdisk.cpio extract 2>/dev/null || \
+            (cpio -idmv < ../vendor_ramdisk.cpio 2>/dev/null || true)
+            
+            cd ..
+          fi
+          
+          # Check for compressed ramdisks
+          for file in *.gz *.lz4 *.xz; do
+            if [ -f "$file" ]; then
+              echo "Found compressed file: $file"
+              case "$file" in
+                *.gz) gunzip -k "$file" || true ;;
+                *.lz4) lz4 -d "$file" "${file%.lz4}" || true ;;
+                *.xz) xz -d "$file" || true ;;
+              esac
+            fi
+          done
+          
+          echo "Final unpacked contents:"
+          find . -type f -exec ls -lh {} \;
+
+      - name: Analyze image structure
+        run: |
+          echo "=== Vendor Boot Image Analysis ==="
+          file vendor_boot.img
+          
+          echo -e "\n=== Hex Header (first 256 bytes) ==="
+          xxd -l 256 vendor_boot.img | head -20
+          
+          echo -e "\n=== Directory Structure ==="
+          tree unpacked_vendor_boot/ || find unpacked_vendor_boot/ -type f | head -30
+
+      - name: Upload unpacked artifacts
+        if: github.event.inputs.upload_artifacts == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpacked-vendor-boot-${{ github.run_number }}
+          path: |
+            unpacked_vendor_boot/
+            vendor_boot.img
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Create Release (optional)
+        if: github.event.inputs.upload_artifacts == 'true' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: android-17-gsi-${{ github.run_number }}
-          name: "Android 17 GSI - CP21.260206.011 (Build ${{ github.run_number }})"
-          body_path: release_notes.md
+          tag_name: vendor-boot-unpack-${{ github.run_number }}
+          name: Unpacked Vendor Boot Image ${{ github.run_number }}
+          body: |
+            Automatically unpacked vendor_boot.img from Archive.org
+            
+            **Source:** ${{ github.event.inputs.image_url }}
+            **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           files: |
-            ${{ env.FILENAME }}
-            checksum.txt
-          draft: false
-          prerelease: true
+            unpacked_vendor_boot/**
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           
