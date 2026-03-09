@@ -1,11 +1,6 @@
 name: Unpack Vendor Boot Image
 
 on:
-  # TEMPORARY: Add this to test the workflow before merging to main
-  # Remove this after testing - it's only needed once to make the button appear
-  pull_request:
-    branches: [main, master]
-  
   workflow_dispatch:
     inputs:
       image_url:
@@ -30,38 +25,111 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget lz4 gzip cpio file
+          sudo apt-get install -y wget lz4 gzip cpio file unzip
+
+      - name: Download and extract magiskboot
+        run: |
+          # Download Magisk APK
+          wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O magisk.zip
+          
+          # Extract magiskboot from the lib directory (x86_64 for GitHub Actions runner)
+          unzip -j magisk.zip "lib/x86_64/libmagiskboot.so" -d ./
+          mv libmagiskboot.so magiskboot
+          chmod +x magiskboot
+          
+          # Verify it works
+          ./magiskboot --help || ./magiskboot 2>&1 | head -20
+          echo "Magiskboot ready"
 
       - name: Download vendor_boot.img
         run: |
-          URL="${{ github.event.inputs.image_url || 'https://archive.org/download/vendor_boot_202603/vendor_boot.img' }}"
+          URL="${{ github.event.inputs.image_url }}"
           echo "Downloading from: $URL"
           wget --progress=bar:force -O vendor_boot.img "$URL"
           ls -lh vendor_boot.img
           file vendor_boot.img
 
-      - name: Download magiskboot
-        run: |
-          wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O magisk.zip
-          unzip -o magisk.zip -d magisk_dir
-          find magisk_dir -name "magiskboot" -exec cp {} ./magiskboot \;
-          chmod +x ./magiskboot
-
       - name: Unpack vendor_boot.img
         run: |
+          # Create output directory
           mkdir -p unpacked
+          
+          # Unpack the vendor_boot image
           ./magiskboot unpack vendor_boot.img
+          
+          # Move all unpacked files to the directory
           mv kernel* unpacked/ 2>/dev/null || true
           mv ramdisk* unpacked/ 2>/dev/null || true
           mv vendor_ramdisk* unpacked/ 2>/dev/null || true
+          mv dtb* unpacked/ 2>/dev/null || true
           mv *.img unpacked/ 2>/dev/null || true
+          
+          echo "Unpacked contents:"
           ls -lah unpacked/
 
+      - name: Extract ramdisk contents
+        run: |
+          cd unpacked
+          
+          # Check for vendor_ramdisk (common in vendor_boot)
+          if [ -f "vendor_ramdisk.cpio" ]; then
+            echo "Found vendor_ramdisk.cpio, extracting..."
+            mkdir -p vendor_ramdisk_extracted
+            cd vendor_ramdisk_extracted
+            
+            # Extract cpio archive using magiskboot
+            ../../magiskboot cpio ../vendor_ramdisk.cpio extract || \
+            (cpio -idmv < ../vendor_ramdisk.cpio 2>/dev/null || true)
+            
+            cd ..
+          fi
+          
+          # Check for standard ramdisk
+          if [ -f "ramdisk.cpio" ]; then
+            echo "Found ramdisk.cpio, extracting..."
+            mkdir -p ramdisk_extracted
+            cd ramdisk_extracted
+            
+            ../../magiskboot cpio ../ramdisk.cpio extract || \
+            (cpio -idmv < ../ramdisk.cpio 2>/dev/null || true)
+            
+            cd ..
+          fi
+          
+          # Handle compressed ramdisks
+          for file in *.gz *.lz4 *.xz 2>/dev/null; do
+            if [ -f "$file" ]; then
+              echo "Decompressing: $file"
+              case "$file" in
+                *.gz) gunzip -k "$file" || true ;;
+                *.lz4) lz4 -d "$file" "${file%.lz4}" || true ;;
+                *.xz) xz -d "$file" || true ;;
+              esac
+            fi
+          done
+          
+          echo "Final contents:"
+          find . -type f -exec ls -lh {} \;
+
+      - name: Analyze image structure
+        run: |
+          echo "=== Vendor Boot Image Analysis ==="
+          file vendor_boot.img
+          
+          echo -e "\n=== Hex Header (first 256 bytes) ==="
+          xxd -l 256 vendor_boot.img | head -20
+          
+          echo -e "\n=== Directory Structure ==="
+          tree unpacked/ || find unpacked/ -type f | head -30
+
       - name: Upload artifacts
-        if: github.event.inputs.upload_artifacts == 'true' || github.event_name == 'pull_request'
+        if: github.event.inputs.upload_artifacts == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: unpacked-vendor-boot
-          path: unpacked/
-          retention-days: 7
+          name: unpacked-vendor-boot-${{ github.run_number }}
+          path: |
+            unpacked/
+            vendor_boot.img
+          retention-days: 30
+          if-no-files-found: warn
           
