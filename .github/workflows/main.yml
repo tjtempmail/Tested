@@ -1,6 +1,11 @@
 name: Unpack Vendor Boot Image
 
 on:
+  # Temporary: Remove after testing, only for initial run
+  push:
+    branches:
+      - '**'
+  
   workflow_dispatch:
     inputs:
       image_url:
@@ -9,108 +14,103 @@ on:
         default: 'https://archive.org/download/vendor_boot_202603/vendor_boot.img'
         type: string
       upload_artifacts:
-        description: 'Upload unpacked contents as artifacts'
+        description: 'Upload artifacts (yes/no)'
         required: true
-        default: true
-        type: boolean
+        default: 'yes'
+        type: string
 
 jobs:
-  unpack-vendor-boot:
+  unpack:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
+      - uses: actions/checkout@v4
+      
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget lz4 gzip cpio file xz-utils xxd \
-            android-sdk-libsparse-utils  # For simg2img
+          sudo apt-get install -y wget file xxd lz4 gzip cpio
 
-      - name: Download vendor_boot.img
+      - name: Download image
         run: |
-          URL="${{ github.event.inputs.image_url }}"
-          echo "Downloading from: $URL"
-          wget --progress=bar:force -O vendor_boot.img "$URL"
+          URL="${{ github.event.inputs.image_url || 'https://archive.org/download/vendor_boot_202603/vendor_boot.img' }}"
+          wget -q --show-progress "$URL" -O vendor_boot.img
           ls -lh vendor_boot.img
-          
-          echo "=== File Analysis ==="
           file vendor_boot.img
-          
-          echo "=== First 32 bytes (hex) ==="
-          xxd -l 32 vendor_boot.img
+          xxd -l 16 vendor_boot.img
 
-      - name: Check if sparse image and convert
-        run: |
-          # Check for sparse magic (0xed26ff3a) at offset 0
-          SPARSE_MAGIC=$(xxd -p -l 4 vendor_boot.img)
-          echo "Sparse magic check: $SPARSE_MAGIC"
-          
-          if [ "$SPARSE_MAGIC" = "3aff26ed" ]; then
-            echo "Detected sparse image format, converting..."
-            simg2img vendor_boot.img vendor_boot_raw.img
-            mv vendor_boot_raw.img vendor_boot.img
-            echo "Converted to raw image"
-            file vendor_boot.img
-          else
-            echo "Not a sparse image (magic: $SPARSE_MAGIC)"
-          fi
-
-      - name: Try Android_boot_image_editor
-        run: |
-          # Clone the comprehensive Android boot image editor
-          git clone --depth 1 https://github.com/cfig/Android_boot_image_editor.git abie
-          cd abie
-          
-          # Copy image
-          cp ../vendor_boot.img ./
-          
-          # Try to unpack
-          ./gradlew unpack || true
-          
-          # Check what was extracted
-          ls -lah build/unzip_boot/ 2>/dev/null || true
-
-      - name: Fallback: Manual extraction if needed
-        run: |
-          # If the above failed, try to identify what we have
-          echo "=== Checking file type again ==="
-          file vendor_boot.img
-          
-          # Check magic at different offsets
-          echo "Magic at 0: $(xxd -p -l 8 vendor_boot.img)"
-          echo "Magic at 4096: $(xxd -p -l 8 -s 4096 vendor_boot.img 2>/dev/null || echo 'N/A')"
-          
-          # If it's ext4, try to mount it
-          if file vendor_boot.img | grep -q "ext4"; then
-            echo "Detected ext4 filesystem, mounting..."
-            mkdir -p mnt
-            sudo mount -o loop vendor_boot.img mnt/ || true
-            ls -lah mnt/ || true
-            sudo umount mnt/ || true
-          fi
-
-      - name: Organize output
+      - name: Unpack vendor_boot
         run: |
           mkdir -p unpacked
           
-          # Copy anything from Android_boot_image_editor
-          if [ -d "abie/build/unzip_boot" ]; then
-            cp -r abie/build/unzip_boot/* unpacked/ 2>/dev/null || true
+          # Check if sparse image
+          MAGIC=$(xxd -p -l 4 vendor_boot.img)
+          if [ "$MAGIC" = "3aff26ed" ]; then
+            echo "Sparse image detected, converting..."
+            simg2img vendor_boot.img vendor_boot.raw.img
+            mv vendor_boot.raw.img vendor_boot.img
           fi
           
-          # Copy original image
-          cp vendor_boot.img unpacked/ 2>/dev/null || true
+          # Manual extraction for VNDRBOOT format
+          echo "Attempting manual extraction..."
+          
+          # Read header fields (little endian)
+          read_le32() {
+            local off=$1
+            local hex=$(dd if=vendor_boot.img bs=1 skip=$off count=4 2>/dev/null | xxd -p)
+            echo $((16#${hex:6:2}${hex:4:2}${hex:2:2}${hex:0:2}))
+          }
+          
+          RAMDISK_SIZE=$(read_le32 16)
+          PAGE_SIZE=$(read_le32 24)
+          HEADER_VERSION=$(read_le32 28)
+          DTB_SIZE=$(read_le32 2104)
+          
+          echo "Ramdisk: $RAMDISK_SIZE, Page: $PAGE_SIZE, Ver: $HEADER_VERSION, DTB: $DTB_SIZE"
+          
+          # Default page size if zero
+          [ "$PAGE_SIZE" -eq 0 ] && PAGE_SIZE=4096
+          
+          HEADER_SIZE=2112
+          [ "$HEADER_VERSION" -eq 4 ] && HEADER_SIZE=2124
+          
+          # Calculate aligned offset
+          RAMDISK_OFFSET=$(( (HEADER_SIZE + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE ))
+          
+          # Extract ramdisk if valid size
+          if [ $RAMDISK_SIZE -gt 0 ] && [ $RAMDISK_SIZE -lt 67108864 ]; then
+            dd if=vendor_boot.img bs=1 skip=$RAMDISK_OFFSET count=$RAMDISK_SIZE of=unpacked/vendor_ramdisk 2>/dev/null
+            
+            # Decompress
+            if file unpacked/vendor_ramdisk | grep -q gzip; then
+              mv unpacked/vendor_ramdisk unpacked/vendor_ramdisk.gz
+              gunzip -c unpacked/vendor_ramdisk.gz > unpacked/vendor_ramdisk.cpio 2>/dev/null || true
+            elif file unpacked/vendor_ramdisk | grep -q LZ4; then
+              mv unpacked/vendor_ramdisk unpacked/vendor_ramdisk.lz4
+              lz4 -d unpacked/vendor_ramdisk.lz4 unpacked/vendor_ramdisk.cpio 2>/dev/null || true
+            fi
+            
+            # Extract cpio
+            if [ -f unpacked/vendor_ramdisk.cpio ]; then
+              mkdir -p unpacked/ramdisk_extracted
+              cd unpacked/ramdisk_extracted
+              cpio -idmv < ../vendor_ramdisk.cpio 2>/dev/null || true
+              cd ../..
+            fi
+          fi
+          
+          # Extract DTB
+          DTB_OFFSET=$(( (RAMDISK_OFFSET + RAMDISK_SIZE + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE ))
+          if [ $DTB_SIZE -gt 0 ] && [ $DTB_SIZE -lt 10000000 ]; then
+            dd if=vendor_boot.img bs=1 skip=$DTB_OFFSET count=$DTB_SIZE of=unpacked/dtb 2>/dev/null
+          fi
           
           ls -lah unpacked/
 
       - name: Upload artifacts
-        if: github.event.inputs.upload_artifacts == 'true'
+        if: github.event.inputs.upload_artifacts == 'yes' || github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
-          name: unpacked-vendor-boot-${{ github.run_number }}
+          name: vendor-boot-unpacked
           path: unpacked/
-          retention-days: 30
-          if-no-files-found: warn
+          retention-days: 7
           
