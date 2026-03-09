@@ -1,22 +1,23 @@
 name: Unpack Vendor Boot Image
 
 on:
-  workflow_dispatch:  # Manual trigger (only shows on default branch)
+  # TEMPORARY: Add this to test the workflow before merging to main
+  # Remove this after testing - it's only needed once to make the button appear
+  pull_request:
+    branches: [main, master]
+  
+  workflow_dispatch:
     inputs:
       image_url:
         description: 'URL to vendor_boot.img'
         required: true
         default: 'https://archive.org/download/vendor_boot_202603/vendor_boot.img'
+        type: string
       upload_artifacts:
         description: 'Upload unpacked contents as artifacts'
         required: true
         default: true
         type: boolean
-  
-  # Add this for testing - remove after merging to main
-  push:
-    branches:
-      - '**'  # Runs on any branch push for testing
 
 jobs:
   unpack-vendor-boot:
@@ -29,171 +30,38 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            wget \
-            xz-utils \
-            lz4 \
-            gzip \
-            cpio \
-            file \
-            p7zip-full \
-            android-sdk-libsparse-utils \
-            liblz4-tool
-
-      - name: Download magiskboot binary
-        run: |
-          # Download latest magiskboot from Magisk releases
-          MAGISK_URL=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest | \
-            grep "browser_download_url.*Magisk.*apk" | cut -d '"' -f 4)
-          
-          # Alternative: Use direct link to magiskboot binary
-          wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O magisk.zip || \
-          wget -q https://github.com/topjohnwu/Magisk/releases/download/v26.4/Magisk-v26.4.apk -O magisk.zip
-          
-          unzip -o magisk.zip -d magisk_extracted || true
-          
-          # Find magiskboot binary (might be in assets)
-          find magisk_extracted -name "magiskboot" -type f -exec cp {} ./magiskboot \; || true
-          
-          # If not found, try extracting from lib
-          if [ ! -f ./magiskboot ]; then
-            # Download prebuilt magiskboot for x86_64
-            wget -q "https://raw.githubusercontent.com/topjohnwu/Magisk/master/native/src/boot/magiskboot.cpp" -O /dev/null || true
-            # Fallback: compile or use alternative source
-            echo "Attempting alternative download method..."
-            wget -q https://github.com/carlodandan/Patch-Recovery-VB/raw/main/bin/magiskboot -O magiskboot || \
-            wget -q https://github.com/osm0sis/Android-Image-Kitchen/raw/master/android_image_kit.sh -O aik.sh
-          fi
-          
-          if [ -f ./magiskboot ]; then
-            chmod +x ./magiskboot
-            echo "Magiskboot ready"
-          fi
+          sudo apt-get install -y wget lz4 gzip cpio file
 
       - name: Download vendor_boot.img
         run: |
-          # Use input if workflow_dispatch, otherwise use default
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            URL="${{ github.event.inputs.image_url }}"
-          else
-            URL="https://archive.org/download/vendor_boot_202603/vendor_boot.img"
-          fi
+          URL="${{ github.event.inputs.image_url || 'https://archive.org/download/vendor_boot_202603/vendor_boot.img' }}"
           echo "Downloading from: $URL"
           wget --progress=bar:force -O vendor_boot.img "$URL"
-          
-          # Verify download
           ls -lh vendor_boot.img
           file vendor_boot.img
 
-      - name: Unpack vendor_boot.img using magiskboot
-        if: hashFiles('magiskboot') != ''
+      - name: Download magiskboot
         run: |
-          mkdir -p unpacked_vendor_boot
-          cd unpacked_vendor_boot
-          
-          # Unpack the vendor_boot image
-          ../magiskboot unpack ../vendor_boot.img
-          
-          echo "Unpacking completed. Contents:"
-          ls -lah
+          wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O magisk.zip
+          unzip -o magisk.zip -d magisk_dir
+          find magisk_dir -name "magiskboot" -exec cp {} ./magiskboot \;
+          chmod +x ./magiskboot
 
-      - name: Alternative: Unpack using Android Image Kitchen
-        if: hashFiles('magiskboot') == ''
+      - name: Unpack vendor_boot.img
         run: |
-          # Clone AIK if magiskboot not available
-          git clone --depth 1 https://github.com/osm0sis/Android-Image-Kitchen.git AIK
-          cd AIK
-          
-          # Move image to AIK directory
-          mv ../vendor_boot.img ./
-          
-          # Unpack
-          bash unpackimg.sh ./vendor_boot.img
-          
-          # Move results back
-          mkdir -p ../unpacked_vendor_boot
-          mv split_img ../unpacked_vendor_boot/ || true
-          mv ramdisk ../unpacked_vendor_boot/ || true
+          mkdir -p unpacked
+          ./magiskboot unpack vendor_boot.img
+          mv kernel* unpacked/ 2>/dev/null || true
+          mv ramdisk* unpacked/ 2>/dev/null || true
+          mv vendor_ramdisk* unpacked/ 2>/dev/null || true
+          mv *.img unpacked/ 2>/dev/null || true
+          ls -lah unpacked/
 
-      - name: Extract ramdisk contents (if present)
-        run: |
-          cd unpacked_vendor_boot
-          
-          # Check for ramdisk files
-          if [ -f "ramdisk.cpio" ]; then
-            echo "Found ramdisk.cpio, extracting..."
-            mkdir -p ramdisk_extracted
-            cd ramdisk_extracted
-            
-            # Extract cpio archive
-            ../magiskboot cpio ../ramdisk.cpio extract || \
-            (cpio -i < ../ramdisk.cpio 2>/dev/null || true)
-            
-            cd ..
-          fi
-          
-          if [ -f "vendor_ramdisk.cpio" ]; then
-            echo "Found vendor_ramdisk.cpio, extracting..."
-            mkdir -p vendor_ramdisk_extracted
-            cd vendor_ramdisk_extracted
-            
-            # Try magiskboot first, then standard cpio
-            ../magiskboot cpio ../vendor_ramdisk.cpio extract 2>/dev/null || \
-            (cpio -idmv < ../vendor_ramdisk.cpio 2>/dev/null || true)
-            
-            cd ..
-          fi
-          
-          # Check for compressed ramdisks
-          for file in *.gz *.lz4 *.xz; do
-            if [ -f "$file" ]; then
-              echo "Found compressed file: $file"
-              case "$file" in
-                *.gz) gunzip -k "$file" || true ;;
-                *.lz4) lz4 -d "$file" "${file%.lz4}" || true ;;
-                *.xz) xz -d "$file" || true ;;
-              esac
-            fi
-          done
-          
-          echo "Final unpacked contents:"
-          find . -type f -exec ls -lh {} \;
-
-      - name: Analyze image structure
-        run: |
-          echo "=== Vendor Boot Image Analysis ==="
-          file vendor_boot.img
-          
-          echo -e "\n=== Hex Header (first 256 bytes) ==="
-          xxd -l 256 vendor_boot.img | head -20
-          
-          echo -e "\n=== Directory Structure ==="
-          tree unpacked_vendor_boot/ || find unpacked_vendor_boot/ -type f | head -30
-
-      - name: Upload unpacked artifacts
-        if: github.event.inputs.upload_artifacts == 'true' || github.event_name == 'push'
+      - name: Upload artifacts
+        if: github.event.inputs.upload_artifacts == 'true' || github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: unpacked-vendor-boot-${{ github.run_number }}
-          path: |
-            unpacked_vendor_boot/
-            vendor_boot.img
-          retention-days: 30
-          if-no-files-found: warn
-
-      - name: Create Release (optional)
-        if: github.event.inputs.upload_artifacts == 'true' && github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: vendor-boot-unpack-${{ github.run_number }}
-          name: Unpacked Vendor Boot Image ${{ github.run_number }}
-          body: |
-            Automatically unpacked vendor_boot.img from Archive.org
-            
-            **Source:** ${{ github.event.inputs.image_url || 'https://archive.org/download/vendor_boot_202603/vendor_boot.img' }}
-            **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          files: |
-            unpacked_vendor_boot/**
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: unpacked-vendor-boot
+          path: unpacked/
+          retention-days: 7
           
