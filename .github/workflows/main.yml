@@ -25,21 +25,15 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget lz4 gzip cpio file unzip
+          sudo apt-get install -y wget lz4 gzip cpio file unzip xz-utils
 
-      - name: Download and extract magiskboot
+      - name: Download Android Image Kitchen
         run: |
-          # Download Magisk APK
-          wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O magisk.zip
-          
-          # Extract magiskboot from the lib directory (x86_64 for GitHub Actions runner)
-          unzip -j magisk.zip "lib/x86_64/libmagiskboot.so" -d ./
-          mv libmagiskboot.so magiskboot
-          chmod +x magiskboot
-          
-          # Verify it works
-          ./magiskboot --help || ./magiskboot 2>&1 | head -20
-          echo "Magiskboot ready"
+          # Clone Android Image Kitchen which supports vendor_boot
+          git clone --depth 1 https://github.com/osm0sis/Android-Image-Kitchen.git AIK
+          cd AIK
+          # Make scripts executable
+          chmod +x unpackimg.sh repackimg.sh cleanup.sh
 
       - name: Download vendor_boot.img
         run: |
@@ -49,67 +43,68 @@ jobs:
           ls -lh vendor_boot.img
           file vendor_boot.img
 
-      - name: Unpack vendor_boot.img
+      - name: Unpack vendor_boot.img using AIK
         run: |
-          # Create output directory
+          # Copy image to AIK directory
+          cp vendor_boot.img AIK/
+          cd AIK
+          
+          # Unpack the image
+          bash unpackimg.sh ./vendor_boot.img
+          
+          # Show results
+          echo "AIK unpacking complete"
+          ls -lah
+
+      - name: Organize output
+        run: |
           mkdir -p unpacked
           
-          # Unpack the vendor_boot image
-          ./magiskboot unpack vendor_boot.img
+          # Move AIK output to unpacked directory
+          if [ -d "AIK/split_img" ]; then
+            mv AIK/split_img unpacked/
+          fi
           
-          # Move all unpacked files to the directory
-          mv kernel* unpacked/ 2>/dev/null || true
-          mv ramdisk* unpacked/ 2>/dev/null || true
-          mv vendor_ramdisk* unpacked/ 2>/dev/null || true
-          mv dtb* unpacked/ 2>/dev/null || true
-          mv *.img unpacked/ 2>/dev/null || true
+          if [ -d "AIK/ramdisk" ]; then
+            mv AIK/ramdisk unpacked/
+          fi
           
-          echo "Unpacked contents:"
+          # Copy the original image
+          cp vendor_boot.img unpacked/ || true
+          
+          echo "Contents organized:"
           ls -lah unpacked/
+          
+          # Show split_img contents if exists
+          if [ -d "unpacked/split_img" ]; then
+            echo -e "\nSplit image components:"
+            ls -lah unpacked/split_img/
+          fi
 
-      - name: Extract ramdisk contents
+      - name: Extract ramdisk contents if present
         run: |
-          cd unpacked
-          
-          # Check for vendor_ramdisk (common in vendor_boot)
-          if [ -f "vendor_ramdisk.cpio" ]; then
-            echo "Found vendor_ramdisk.cpio, extracting..."
-            mkdir -p vendor_ramdisk_extracted
-            cd vendor_ramdisk_extracted
+          if [ -f "unpacked/ramdisk.cpio.gz" ] || [ -f "unpacked/ramdisk.cpio" ]; then
+            echo "Found ramdisk, extracting..."
+            cd unpacked
             
-            # Extract cpio archive using magiskboot
-            ../../magiskboot cpio ../vendor_ramdisk.cpio extract || \
-            (cpio -idmv < ../vendor_ramdisk.cpio 2>/dev/null || true)
-            
-            cd ..
-          fi
-          
-          # Check for standard ramdisk
-          if [ -f "ramdisk.cpio" ]; then
-            echo "Found ramdisk.cpio, extracting..."
-            mkdir -p ramdisk_extracted
-            cd ramdisk_extracted
-            
-            ../../magiskboot cpio ../ramdisk.cpio extract || \
-            (cpio -idmv < ../ramdisk.cpio 2>/dev/null || true)
-            
-            cd ..
-          fi
-          
-          # Handle compressed ramdisks
-          for file in *.gz *.lz4 *.xz 2>/dev/null; do
-            if [ -f "$file" ]; then
-              echo "Decompressing: $file"
-              case "$file" in
-                *.gz) gunzip -k "$file" || true ;;
-                *.lz4) lz4 -d "$file" "${file%.lz4}" || true ;;
-                *.xz) xz -d "$file" || true ;;
-              esac
+            # Determine compression
+            if [ -f "ramdisk.cpio.gz" ]; then
+              gunzip -c ramdisk.cpio.gz > ramdisk.cpio || true
             fi
-          done
+            
+            if [ -f "ramdisk.cpio" ]; then
+              mkdir -p ramdisk_extracted
+              cd ramdisk_extracted
+              cpio -idmv < ../ramdisk.cpio || true
+              cd ..
+            fi
+          fi
           
-          echo "Final contents:"
-          find . -type f -exec ls -lh {} \;
+          # Check AIK ramdisk directory
+          if [ -d "unpacked/ramdisk" ]; then
+            echo -e "\nAIK ramdisk directory contents:"
+            ls -lah unpacked/ramdisk/ || true
+          fi
 
       - name: Analyze image structure
         run: |
@@ -120,16 +115,14 @@ jobs:
           xxd -l 256 vendor_boot.img | head -20
           
           echo -e "\n=== Directory Structure ==="
-          tree unpacked/ || find unpacked/ -type f | head -30
+          find unpacked/ -type f -exec ls -lh {} \; 2>/dev/null | head -30
 
       - name: Upload artifacts
         if: github.event.inputs.upload_artifacts == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: unpacked-vendor-boot-${{ github.run_number }}
-          path: |
-            unpacked/
-            vendor_boot.img
+          path: unpacked/
           retention-days: 30
           if-no-files-found: warn
           
