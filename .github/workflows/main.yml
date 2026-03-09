@@ -25,7 +25,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget lz4 gzip cpio file xz-utils xxd
+          sudo apt-get install -y wget lz4 gzip cpio file xz-utils xxd \
+            android-sdk-libsparse-utils  # For simg2img
 
       - name: Download vendor_boot.img
         run: |
@@ -33,142 +34,83 @@ jobs:
           echo "Downloading from: $URL"
           wget --progress=bar:force -O vendor_boot.img "$URL"
           ls -lh vendor_boot.img
+          
+          echo "=== File Analysis ==="
+          file vendor_boot.img
+          
+          echo "=== First 32 bytes (hex) ==="
+          xxd -l 32 vendor_boot.img
 
-      - name: Create unpack script
+      - name: Check if sparse image and convert
         run: |
-          cat > unpack_vendor_boot.sh << 'EOF'
-          #!/bin/bash
-          set -e
+          # Check for sparse magic (0xed26ff3a) at offset 0
+          SPARSE_MAGIC=$(xxd -p -l 4 vendor_boot.img)
+          echo "Sparse magic check: $SPARSE_MAGIC"
           
-          IMAGE="$1"
-          OUTDIR="${2:-unpacked}"
-          
-          if [ -z "$IMAGE" ]; then
-              echo "Usage: $0 <vendor_boot.img> [output_dir]"
-              exit 1
+          if [ "$SPARSE_MAGIC" = "3aff26ed" ]; then
+            echo "Detected sparse image format, converting..."
+            simg2img vendor_boot.img vendor_boot_raw.img
+            mv vendor_boot_raw.img vendor_boot.img
+            echo "Converted to raw image"
+            file vendor_boot.img
+          else
+            echo "Not a sparse image (magic: $SPARSE_MAGIC)"
           fi
-          
-          mkdir -p "$OUTDIR"
-          
-          echo "=== Analyzing $IMAGE ==="
-          FILESIZE=$(stat -c%s "$IMAGE")
-          echo "File size: $FILESIZE bytes ($((FILESIZE / 1024 / 1024)) MB)"
-          
-          # Read magic
-          MAGIC=$(xxd -p -l 8 "$IMAGE")
-          echo "Magic bytes: $MAGIC"
-          MAGIC_ASCII=$(echo "$MAGIC" | xxd -r -p)
-          echo "Magic (ASCII): $MAGIC_ASCII"
-          
-          if [ "$MAGIC_ASCII" != "VNDRBOOT" ]; then
-              echo "Warning: Expected VNDRBOOT magic, got '$MAGIC_ASCII'"
-          fi
-          
-          # Helper to read little-endian 32-bit int
-          read_le32() {
-              local off=$1
-              local hex=$(dd if="$IMAGE" bs=1 skip=$off count=4 2>/dev/null | xxd -p)
-              # Reverse bytes for little endian
-              echo $((16#${hex:6:2}${hex:4:2}${hex:2:2}${hex:0:2}))
-          }
-          
-          echo ""
-          echo "=== Header Info ==="
-          KERNEL_SIZE=$(read_le32 8)
-          RAMDISK_SIZE=$(read_le32 16)
-          PAGE_SIZE=$(read_le32 24)
-          HEADER_VERSION=$(read_le32 28)
-          DTB_SIZE=$(read_le32 2104)
-          
-          echo "Kernel size: $KERNEL_SIZE"
-          echo "Ramdisk size: $RAMDISK_SIZE"
-          echo "Page size: $PAGE_SIZE"
-          echo "Header version: $HEADER_VERSION"
-          echo "DTB size: $DTB_SIZE"
-          
-          # Determine header size
-          HEADER_SIZE=2112
-          [ "$HEADER_VERSION" -eq 4 ] && HEADER_SIZE=2124
-          echo "Header size: $HEADER_SIZE"
-          
-          # Align function
-          align() {
-              echo $(( ($1 + $2 - 1) / $2 * $2 ))
-          }
-          
-          echo ""
-          echo "=== Extracting ==="
-          
-          # Calculate offsets
-          RAMDISK_OFFSET=$(align $HEADER_SIZE $PAGE_SIZE)
-          echo "Ramdisk offset: $RAMDISK_OFFSET"
-          
-          # Extract ramdisk
-          if [ $RAMDISK_SIZE -gt 0 ] && [ $RAMDISK_SIZE -lt $FILESIZE ]; then
-              echo "Extracting ramdisk..."
-              dd if="$IMAGE" bs=1 skip=$RAMDISK_OFFSET count=$RAMDISK_SIZE of="$OUTDIR/vendor_ramdisk" 2>/dev/null
-              
-              # Detect and decompress
-              if file "$OUTDIR/vendor_ramdisk" | grep -q "gzip"; then
-                  echo "  Decompressing gzip..."
-                  mv "$OUTDIR/vendor_ramdisk" "$OUTDIR/vendor_ramdisk.gz"
-                  gunzip -c "$OUTDIR/vendor_ramdisk.gz" > "$OUTDIR/vendor_ramdisk.cpio" 2>/dev/null || true
-              elif file "$OUTDIR/vendor_ramdisk" | grep -q "LZ4"; then
-                  echo "  Decompressing LZ4..."
-                  mv "$OUTDIR/vendor_ramdisk" "$OUTDIR/vendor_ramdisk.lz4"
-                  lz4 -d "$OUTDIR/vendor_ramdisk.lz4" "$OUTDIR/vendor_ramdisk.cpio" 2>/dev/null || true
-              else
-                  cp "$OUTDIR/vendor_ramdisk" "$OUTDIR/vendor_ramdisk.cpio"
-              fi
-              
-              # Extract cpio contents
-              if [ -f "$OUTDIR/vendor_ramdisk.cpio" ]; then
-                  echo "  Extracting cpio..."
-                  mkdir -p "$OUTDIR/vendor_ramdisk_extracted"
-                  cd "$OUTDIR/vendor_ramdisk_extracted"
-                  cpio -idmv < ../vendor_ramdisk.cpio 2>/dev/null || true
-                  cd ../..
-              fi
-          fi
-          
-          # Extract DTB
-          DTB_OFFSET=$(align $((RAMDISK_OFFSET + RAMDISK_SIZE)) $PAGE_SIZE)
-          if [ $DTB_SIZE -gt 0 ] && [ $DTB_SIZE -lt $FILESIZE ]; then
-              echo "Extracting DTB..."
-              dd if="$IMAGE" bs=1 skip=$DTB_OFFSET count=$DTB_SIZE of="$OUTDIR/dtb" 2>/dev/null
-          fi
-          
-          echo ""
-          echo "=== Done ==="
-          ls -lah "$OUTDIR/"
-          EOF
-          
-          chmod +x unpack_vendor_boot.sh
 
-      - name: Unpack vendor_boot.img
+      - name: Try Android_boot_image_editor
         run: |
-          ./unpack_vendor_boot.sh vendor_boot.img unpacked
+          # Clone the comprehensive Android boot image editor
+          git clone --depth 1 https://github.com/cfig/Android_boot_image_editor.git abie
+          cd abie
+          
+          # Copy image
+          cp ../vendor_boot.img ./
+          
+          # Try to unpack
+          ./gradlew unpack || true
+          
+          # Check what was extracted
+          ls -lah build/unzip_boot/ 2>/dev/null || true
 
-      - name: Analyze results
+      - name: Fallback: Manual extraction if needed
         run: |
-          echo "=== Final Analysis ==="
+          # If the above failed, try to identify what we have
+          echo "=== Checking file type again ==="
+          file vendor_boot.img
+          
+          # Check magic at different offsets
+          echo "Magic at 0: $(xxd -p -l 8 vendor_boot.img)"
+          echo "Magic at 4096: $(xxd -p -l 8 -s 4096 vendor_boot.img 2>/dev/null || echo 'N/A')"
+          
+          # If it's ext4, try to mount it
+          if file vendor_boot.img | grep -q "ext4"; then
+            echo "Detected ext4 filesystem, mounting..."
+            mkdir -p mnt
+            sudo mount -o loop vendor_boot.img mnt/ || true
+            ls -lah mnt/ || true
+            sudo umount mnt/ || true
+          fi
+
+      - name: Organize output
+        run: |
+          mkdir -p unpacked
+          
+          # Copy anything from Android_boot_image_editor
+          if [ -d "abie/build/unzip_boot" ]; then
+            cp -r abie/build/unzip_boot/* unpacked/ 2>/dev/null || true
+          fi
+          
+          # Copy original image
+          cp vendor_boot.img unpacked/ 2>/dev/null || true
+          
           ls -lah unpacked/
-          
-          echo ""
-          echo "=== File Types ==="
-          for f in unpacked/*; do
-              if [ -f "$f" ]; then
-                  file "$f"
-              fi
-          done
 
       - name: Upload artifacts
         if: github.event.inputs.upload_artifacts == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: unpacked-vendor-boot-${{ github.run_number }}
-          path: |
-            unpacked/
-            vendor_boot.img
+          path: unpacked/
           retention-days: 30
+          if-no-files-found: warn
           
