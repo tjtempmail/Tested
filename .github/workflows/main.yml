@@ -1,33 +1,160 @@
-name: Build Kernel Only for Infinix X659B
+name: Extract Info from boot.img
 
 on:
   workflow_dispatch:
+    inputs:
+      bootimg_url:
+        description: 'Direct URL to stock boot.img (e.g., from Google Drive)'
+        required: true
+        type: string
 
 jobs:
-  build-kernel-only:
+  extract-info:
     runs-on: ubuntu-22.04
 
     steps:
+      - name: Checkout dummy repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y git gcc-aarch64-linux-gnu libssl-dev flex bison bc
+          sudo apt install -y \
+            wget curl \
+            device-tree-compiler \
+            cpio \
+            binutils \
+            file
 
-      - name: Clone kernel source
-        run: git clone --depth 1 https://github.com/mt6768-mainline/linux.git
-
-      - name: Configure kernel
+      - name: Clone and build mkbootimg (for unpackbootimg)
         run: |
-          cd linux
-          make ARCH=arm64 mt6768_defconfig
+          git clone https://github.com/osm0sis/mkbootimg.git
+          cd mkbootimg
+          make
+          echo "$(pwd)" >> $GITHUB_PATH
 
-      - name: Build kernel image
+      - name: Download boot.img from provided URL
         run: |
-          cd linux
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image.gz
+          wget -O stock-boot.img "${{ inputs.bootimg_url }}"
+          echo "Downloaded file size: $(du -h stock-boot.img | cut -f1)"
+          file stock-boot.img
 
-      - name: Upload kernel image
+      - name: Create output directory
+        run: mkdir -p output
+
+      - name: Unpack boot.img
+        run: |
+          mkdir -p boot_unpacked
+          unpackbootimg -i stock-boot.img -o boot_unpacked/
+          ls -la boot_unpacked/
+          cp boot_unpacked/* output/ 2>/dev/null || true
+
+      - name: Extract kernel command line
+        run: |
+          if [ -f boot_unpacked/stock-boot.img-cmdline ]; then
+            cat boot_unpacked/stock-boot.img-cmdline > output/cmdline.txt
+            echo "Kernel command line:"
+            cat output/cmdline.txt
+          else
+            echo "No cmdline file found" > output/cmdline.txt
+          fi
+
+      - name: Extract base address and pagesize
+        run: |
+          if [ -f boot_unpacked/stock-boot.img-base ]; then
+            cp boot_unpacked/stock-boot.img-base output/base.txt
+            echo "Base address: $(cat output/base.txt)"
+          fi
+          if [ -f boot_unpacked/stock-boot.img-pagesize ]; then
+            cp boot_unpacked/stock-boot.img-pagesize output/pagesize.txt
+            echo "Pagesize: $(cat output/pagesize.txt)"
+          fi
+
+      - name: Extract kernel version from zImage
+        run: |
+          if [ -f boot_unpacked/stock-boot.img-zImage ]; then
+            cp boot_unpacked/stock-boot.img-zImage output/zImage
+            # Try to get version string from kernel image
+            strings boot_unpacked/stock-boot.img-zImage | grep -E '^Linux version [0-9]' | head -1 > output/kernel_version.txt
+            if [ -s output/kernel_version.txt ]; then
+              echo "Kernel version:"
+              cat output/kernel_version.txt
+            else
+              echo "Could not extract kernel version" > output/kernel_version.txt
+            fi
+          else
+            echo "No zImage found" > output/kernel_version.txt
+          fi
+
+      - name: Extract ramdisk contents (if not empty)
+        run: |
+          if [ -f boot_unpacked/stock-boot.img-ramdisk ]; then
+            cp boot_unpacked/stock-boot.img-ramdisk output/ramdisk.cpio.gz
+            mkdir -p ramdisk_root
+            cd ramdisk_root
+            gunzip -c ../output/ramdisk.cpio.gz | cpio -i --quiet 2>/dev/null || echo "Ramdisk extraction failed (maybe not cpio.gz)"
+            cd ..
+            # List important files
+            echo "Ramdisk contents (top-level):" > output/ramdisk_list.txt
+            ls -la ramdisk_root/ >> output/ramdisk_list.txt 2>/dev/null
+            # Check for init, default.prop, etc.
+            [ -f ramdisk_root/init ] && echo "init found" >> output/ramdisk_list.txt
+            [ -f ramdisk_root/default.prop ] && head -5 ramdisk_root/default.prop >> output/ramdisk_list.txt
+            # Archive ramdisk for download
+            tar -czf output/ramdisk_extracted.tar.gz -C ramdisk_root . 2>/dev/null || true
+          else
+            echo "No ramdisk found" > output/ramdisk_list.txt
+          fi
+
+      - name: Convert DTB to DTS
+        run: |
+          if [ -f boot_unpacked/stock-boot.img-dtb ]; then
+            cp boot_unpacked/stock-boot.img-dtb output/original.dtb
+            dtc -I dtb -O dts -o output/stock.dts output/original.dtb 2> output/dtc_warnings.txt || echo "dtc conversion failed"
+            echo "Device tree converted to DTS. Warnings (if any):"
+            cat output/dtc_warnings.txt
+            # Extract model and compatible
+            grep -E "model\s*=" output/stock.dts | head -5 > output/model.txt
+            grep -E "compatible\s*=" output/stock.dts | head -5 > output/compatible.txt
+          else
+            echo "No DTB found" > output/stock.dts
+          fi
+
+      - name: Generate summary info
+        run: |
+          {
+            echo "BOOT.IMG INFO SUMMARY"
+            echo "====================="
+            echo "File size: $(du -h stock-boot.img | cut -f1)"
+            echo ""
+            echo "--- Kernel ---"
+            if [ -f output/kernel_version.txt ]; then
+              cat output/kernel_version.txt
+            else
+              echo "Unknown"
+            fi
+            echo ""
+            echo "--- Command Line ---"
+            cat output/cmdline.txt
+            echo ""
+            echo "--- Base Address ---"
+            cat output/base.txt
+            echo "--- Pagesize ---"
+            cat output/pagesize.txt
+            echo ""
+            echo "--- Device Tree Model ---"
+            cat output/model.txt
+            echo "--- Device Tree Compatible ---"
+            cat output/compatible.txt
+            echo ""
+            echo "--- Ramdisk Top Files ---"
+            cat output/ramdisk_list.txt
+          } > output/INFO.txt
+
+      - name: Upload all extracted info as artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: x659b-kernel-Image.gz
-          path: linux/arch/arm64/boot/Image.gz
+          name: bootimg-info
+          path: output/
