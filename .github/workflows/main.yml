@@ -1,56 +1,40 @@
-name: Build mt6768 Mainline Kernel
+name: Build for Infinix X659B
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-  workflow_dispatch:      # Manual trigger bhi allow karta hai
+  workflow_dispatch:
 
 jobs:
-  build-kernel:
-    runs-on: ubuntu-22.04   # Latest stable Ubuntu
+  build-x659b:
+    runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1      # Sirf latest commit chahiye
-
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y \
-            git make gcc-aarch64-linux-gnu \
-            libssl-dev flex bison bc \
-            python3 python3-pip \
-            device-tree-compiler \
-            cpio rsync
+          sudo apt install -y git gcc-aarch64-linux-gnu libssl-dev flex bison bc device-tree-compiler
 
-      - name: Set up cross-compilation environment
+      - name: Clone kernel source
+        run: git clone --depth 1 https://github.com/mt6768-mainline/linux.git
+
+      - name: Configure
         run: |
-          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
-          echo "ARCH=arm64" >> $GITHUB_ENV
+          cd linux
+          make ARCH=arm64 mt6768_defconfig
 
-      - name: Clean previous builds (optional)
-        run: make mrproper
-
-      - name: Configure kernel (mt6768_defconfig)
-        run: make mt6768_defconfig
-
-      - name: Build kernel image and device trees
+      - name: Build kernel
         run: |
-          make -j$(nproc) Image.gz
-          make -j$(nproc) dtbs
+          cd linux
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image.gz
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) dtbs
 
-      - name: Upload kernel image as artifact
+      - name: Create boot.img structure
+        run: |
+          mkdir -p boot_artifacts
+          cp linux/arch/arm64/boot/Image.gz boot_artifacts/
+          cp linux/arch/arm64/boot/dts/mediatek/mt6768*.dtb boot_artifacts/
+
+      - name: Upload all files
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-Image.gz
-          path: arch/arm64/boot/Image.gz
-
-      - name: Upload device tree blobs
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-dtbs
-          path: arch/arm64/boot/dts/mediatek/
+          name: x659b-kernel-files
+          path: boot_artifacts/
