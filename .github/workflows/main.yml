@@ -30,11 +30,10 @@ jobs:
             xz-utils \
             lz4
 
-      - name: Download magiskboot
+      - name: Download magiskboot binary
         run: |
-          # Download latest magiskboot binary (prebuilt for Linux)
-          wget -O magiskboot https://github.com/topjohnwu/Magisk/releases/download/v28.1/magiskboot-28.1.tar.xz
-          tar -xf magiskboot-28.1.tar.xz
+          # Direct download of magiskboot Linux executable from official release
+          wget -O magiskboot https://github.com/topjohnwu/Magisk/releases/download/v28.1/magiskboot
           chmod +x magiskboot
           echo "$(pwd)" >> $GITHUB_PATH
 
@@ -98,8 +97,15 @@ jobs:
             
             # Also copy original dtb
             cp dtb output/original.dtb
+          elif [ -f kernel_dtb ]; then
+            echo "Using kernel_dtb instead of dtb" > output/dtb_filetype.txt
+            file kernel_dtb >> output/dtb_filetype.txt
+            dtc -I dtb -O dts -o output/stock.dts kernel_dtb 2> output/dtc_errors.txt || {
+              fdtdump kernel_dtb > output/fdtdump.txt 2>&1
+            }
+            cp kernel_dtb output/original.dtb
           else
-            echo "No dtb file extracted by magiskboot." > output/dtb_filetype.txt
+            echo "No dtb or kernel_dtb file extracted." > output/dtb_filetype.txt
           fi
 
       - name: Extract ramdisk contents
@@ -165,6 +171,6 @@ jobs:
             kernel
             ramdisk.cpio
             dtb
-            header
             kernel_dtb
+            header
           if-no-files-found: ignore
