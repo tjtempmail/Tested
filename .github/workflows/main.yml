@@ -1,40 +1,33 @@
-name: Build for Infinix X659B
+name: Build Kernel Only for Infinix X659B
 
 on:
   workflow_dispatch:
 
 jobs:
-  build-x659b:
+  build-kernel-only:
     runs-on: ubuntu-22.04
 
     steps:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y git gcc-aarch64-linux-gnu libssl-dev flex bison bc device-tree-compiler
+          sudo apt install -y git gcc-aarch64-linux-gnu libssl-dev flex bison bc
 
       - name: Clone kernel source
         run: git clone --depth 1 https://github.com/mt6768-mainline/linux.git
 
-      - name: Configure
+      - name: Configure kernel
         run: |
           cd linux
           make ARCH=arm64 mt6768_defconfig
 
-      - name: Build kernel
+      - name: Build kernel image
         run: |
           cd linux
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image.gz
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) dtbs
 
-      - name: Create boot.img structure
-        run: |
-          mkdir -p boot_artifacts
-          cp linux/arch/arm64/boot/Image.gz boot_artifacts/
-          cp linux/arch/arm64/boot/dts/mediatek/mt6768*.dtb boot_artifacts/
-
-      - name: Upload all files
+      - name: Upload kernel image
         uses: actions/upload-artifact@v4
         with:
-          name: x659b-kernel-files
-          path: boot_artifacts/
+          name: x659b-kernel-Image.gz
+          path: linux/arch/arm64/boot/Image.gz
