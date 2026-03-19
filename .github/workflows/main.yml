@@ -1,4 +1,4 @@
-name: Extract Info from boot.img
+name: Extract Info from boot.img (Android 11 Fixed)
 
 on:
   workflow_dispatch:
@@ -26,13 +26,16 @@ jobs:
             device-tree-compiler \
             cpio \
             binutils \
-            file
+            file \
+            xz-utils \
+            lz4
 
-      - name: Clone and build mkbootimg (for unpackbootimg)
+      - name: Download magiskboot
         run: |
-          git clone https://github.com/osm0sis/mkbootimg.git
-          cd mkbootimg
-          make
+          # Download latest magiskboot binary (prebuilt for Linux)
+          wget -O magiskboot https://github.com/topjohnwu/Magisk/releases/download/v28.1/magiskboot-28.1.tar.xz
+          tar -xf magiskboot-28.1.tar.xz
+          chmod +x magiskboot
           echo "$(pwd)" >> $GITHUB_PATH
 
       - name: Download boot.img from provided URL
@@ -44,40 +47,32 @@ jobs:
       - name: Create output directory
         run: mkdir -p output
 
-      - name: Unpack boot.img
+      - name: Unpack boot.img with magiskboot
         run: |
-          mkdir -p boot_unpacked
-          unpackbootimg -i stock-boot.img -o boot_unpacked/
-          ls -la boot_unpacked/
-          cp boot_unpacked/* output/ 2>/dev/null || true
+          ./magiskboot unpack stock-boot.img
+          echo "Files extracted by magiskboot:"
+          ls -la
+          # Copy extracted files to output
+          cp kernel output/ 2>/dev/null || true
+          cp ramdisk.cpio output/ 2>/dev/null || true
+          cp dtb output/ 2>/dev/null || true
+          cp header output/ 2>/dev/null || true
+          cp kernel_dtb output/ 2>/dev/null || true
 
-      - name: Extract kernel command line
+      - name: Extract kernel command line from header
         run: |
-          if [ -f boot_unpacked/stock-boot.img-cmdline ]; then
-            cat boot_unpacked/stock-boot.img-cmdline > output/cmdline.txt
+          if [ -f header ]; then
+            grep -a "cmdline=" header | cut -d= -f2- > output/cmdline.txt
             echo "Kernel command line:"
             cat output/cmdline.txt
           else
-            echo "No cmdline file found" > output/cmdline.txt
+            echo "No header file" > output/cmdline.txt
           fi
 
-      - name: Extract base address and pagesize
+      - name: Extract kernel version from kernel image
         run: |
-          if [ -f boot_unpacked/stock-boot.img-base ]; then
-            cp boot_unpacked/stock-boot.img-base output/base.txt
-            echo "Base address: $(cat output/base.txt)"
-          fi
-          if [ -f boot_unpacked/stock-boot.img-pagesize ]; then
-            cp boot_unpacked/stock-boot.img-pagesize output/pagesize.txt
-            echo "Pagesize: $(cat output/pagesize.txt)"
-          fi
-
-      - name: Extract kernel version from zImage
-        run: |
-          if [ -f boot_unpacked/stock-boot.img-zImage ]; then
-            cp boot_unpacked/stock-boot.img-zImage output/zImage
-            # Try to get version string from kernel image
-            strings boot_unpacked/stock-boot.img-zImage | grep -E '^Linux version [0-9]' | head -1 > output/kernel_version.txt
+          if [ -f kernel ]; then
+            strings kernel | grep -E '^Linux version [0-9]' | head -1 > output/kernel_version.txt
             if [ -s output/kernel_version.txt ]; then
               echo "Kernel version:"
               cat output/kernel_version.txt
@@ -85,18 +80,40 @@ jobs:
               echo "Could not extract kernel version" > output/kernel_version.txt
             fi
           else
-            echo "No zImage found" > output/kernel_version.txt
+            echo "No kernel file" > output/kernel_version.txt
           fi
 
-      - name: Extract ramdisk contents (if not empty)
+      - name: Convert DTB to DTS (if found)
         run: |
-          if [ -f boot_unpacked/stock-boot.img-ramdisk ]; then
-            cp boot_unpacked/stock-boot.img-ramdisk output/ramdisk.cpio.gz
+          if [ -f dtb ]; then
+            echo "dtb file found. Size: $(du -h dtb | cut -f1)"
+            file dtb > output/dtb_filetype.txt
+            cat output/dtb_filetype.txt
+            
+            # Try dtc conversion
+            dtc -I dtb -O dts -o output/stock.dts dtb 2> output/dtc_errors.txt || {
+              echo "dtc conversion failed. Trying fdtdump..." >> output/dtc_errors.txt
+              fdtdump dtb > output/fdtdump.txt 2>&1
+            }
+            
+            # Also copy original dtb
+            cp dtb output/original.dtb
+          else
+            echo "No dtb file extracted by magiskboot." > output/dtb_filetype.txt
+          fi
+
+      - name: Extract ramdisk contents
+        run: |
+          if [ -f ramdisk.cpio ]; then
             mkdir -p ramdisk_root
             cd ramdisk_root
-            gunzip -c ../output/ramdisk.cpio.gz | cpio -i --quiet 2>/dev/null || echo "Ramdisk extraction failed (maybe not cpio.gz)"
+            # Try to decompress if it's gzipped
+            if file ../ramdisk.cpio | grep -q gzip; then
+              gunzip -c ../ramdisk.cpio | cpio -i -d -m --quiet 2>/dev/null || echo "cpio extraction failed"
+            else
+              cpio -i -d -m --quiet < ../ramdisk.cpio 2>/dev/null || echo "cpio extraction failed"
+            fi
             cd ..
-            # List important files
             echo "Ramdisk contents (top-level):" > output/ramdisk_list.txt
             ls -la ramdisk_root/ >> output/ramdisk_list.txt 2>/dev/null
             # Check for init, default.prop, etc.
@@ -105,21 +122,7 @@ jobs:
             # Archive ramdisk for download
             tar -czf output/ramdisk_extracted.tar.gz -C ramdisk_root . 2>/dev/null || true
           else
-            echo "No ramdisk found" > output/ramdisk_list.txt
-          fi
-
-      - name: Convert DTB to DTS
-        run: |
-          if [ -f boot_unpacked/stock-boot.img-dtb ]; then
-            cp boot_unpacked/stock-boot.img-dtb output/original.dtb
-            dtc -I dtb -O dts -o output/stock.dts output/original.dtb 2> output/dtc_warnings.txt || echo "dtc conversion failed"
-            echo "Device tree converted to DTS. Warnings (if any):"
-            cat output/dtc_warnings.txt
-            # Extract model and compatible
-            grep -E "model\s*=" output/stock.dts | head -5 > output/model.txt
-            grep -E "compatible\s*=" output/stock.dts | head -5 > output/compatible.txt
-          else
-            echo "No DTB found" > output/stock.dts
+            echo "No ramdisk.cpio found" > output/ramdisk_list.txt
           fi
 
       - name: Generate summary info
@@ -130,24 +133,24 @@ jobs:
             echo "File size: $(du -h stock-boot.img | cut -f1)"
             echo ""
             echo "--- Kernel ---"
-            if [ -f output/kernel_version.txt ]; then
-              cat output/kernel_version.txt
-            else
-              echo "Unknown"
-            fi
+            cat output/kernel_version.txt
             echo ""
             echo "--- Command Line ---"
             cat output/cmdline.txt
             echo ""
-            echo "--- Base Address ---"
-            cat output/base.txt
-            echo "--- Pagesize ---"
-            cat output/pagesize.txt
-            echo ""
-            echo "--- Device Tree Model ---"
-            cat output/model.txt
-            echo "--- Device Tree Compatible ---"
-            cat output/compatible.txt
+            echo "--- Device Tree Info ---"
+            if [ -f output/dtb_filetype.txt ]; then
+              cat output/dtb_filetype.txt
+            fi
+            if [ -f output/stock.dts ]; then
+              echo "DTS successfully generated. First 20 lines:"
+              head -20 output/stock.dts
+            elif [ -f output/fdtdump.txt ]; then
+              echo "FDT Dump (first 30 lines):"
+              head -30 output/fdtdump.txt
+            else
+              echo "No device tree information available."
+            fi
             echo ""
             echo "--- Ramdisk Top Files ---"
             cat output/ramdisk_list.txt
@@ -156,5 +159,12 @@ jobs:
       - name: Upload all extracted info as artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: bootimg-info
-          path: output/
+          name: bootimg-info-android11
+          path: |
+            output/
+            kernel
+            ramdisk.cpio
+            dtb
+            header
+            kernel_dtb
+          if-no-files-found: ignore
