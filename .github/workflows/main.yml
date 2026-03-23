@@ -1,4 +1,4 @@
-name: Infinix X659B Firmware Dump
+name: Infinix X659B Firmware Dump (Direct Tool)
 
 on:
   workflow_dispatch:
@@ -22,78 +22,204 @@ on:
           - pac
           - ofp
           - nb0
+      use_aria2:
+        description: 'Use aria2 for faster downloads'
+        required: false
+        default: true
+        type: boolean
 
 env:
   FIRMWARE_URL: ${{ github.event.inputs.firmware_url }}
   FIRMWARE_TYPE: ${{ github.event.inputs.firmware_type }}
+  USE_ARIA2: ${{ github.event.inputs.use_aria2 }}
 
 jobs:
   dump-firmware:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker
-        uses: docker/setup-buildx-action@v3
+      - name: Install dependencies and Phoenix Firmware Dumper
+        run: |
+          echo "=== Installing System Dependencies ==="
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            aria2 \
+            wget \
+            curl \
+            git \
+            python3 \
+            python3-pip \
+            python3-venv \
+            p7zip-full \
+            p7zip-rar \
+            unzip \
+            tar \
+            gzip \
+            xz-utils \
+            lz4 \
+            brotli \
+            simg2img \
+            liblz4-tool \
+            libmagickwand-dev \
+            unace \
+            unrar \
+            zip \
+            file \
+            zstd \
+            qemu-utils \
+            qemu-user-static \
+            binwalk \
+            sleuthkit \
+            android-sdk-libsparse-utils \
+            libxml2 \
+            libxml2-dev \
+            libxslt1-dev \
+            libffi-dev \
+            libssl-dev \
+            zlib1g-dev \
+            build-essential \
+            cmake \
+            clang \
+            pkg-config \
+            libz-dev \
+            libbz2-dev \
+            libreadline-dev \
+            libsqlite3-dev \
+            libncursesw5-dev \
+            xz-utils \
+            tk-dev \
+            libxml2-dev \
+            libxmlsec1-dev \
+            libffi-dev \
+            liblzma-dev \
+            patchelf \
+            2>&1 | grep -v "debconf\|Selecting\|Preparing\|Unpacking\|Setting up\|Processing\|Scanning\|Building" || true
+
+          echo "=== Verifying aria2 installation ==="
+          aria2c --version | head -5
+
+          echo "=== Installing Python packages ==="
+          pip3 install -q --upgrade pip setuptools wheel
+          pip3 install -q \
+            backports.lzma \
+            docopt \
+            git+https://github.com/seemoo-lab/pyshim.git \
+            git+https://github.com/seemoo-lab/firmadyne.git \
+            protobuf \
+            pycryptodome \
+            six \
+            requests \
+            beautifulsoup4 \
+            lxml \
+            html5lib \
+            2>&1 | tail -5 || true
+
+          echo "=== Installing Payload Dumper Go ==="
+          wget -q https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          tar -xzf payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          chmod +x payload-dumper-go
+          sudo mv payload-dumper-go /usr/local/bin/
+          rm payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          payload-dumper-go --version
+
+          echo "=== Cloning Phoenix Firmware Dumper ==="
+          git clone --depth 1 https://github.com/DroidDumps/phoenix_firmware_dumper.git
+          cd phoenix_firmware_dumper
+          
+          echo "=== Running Phoenix Setup ==="
+          chmod +x setup.sh
+          ./setup.sh 2>&1 | tail -20 || true
+          
+          echo "=== Setup Complete ==="
+          ls -la
 
       - name: Free up disk space
         run: |
+          echo "=== Cleaning up disk space ==="
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
           sudo rm -rf "/usr/local/share/boost"
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
           sudo apt-get clean
           df -h
 
-      - name: Download firmware
+      - name: Download firmware with aria2
         run: |
-          echo "Downloading firmware from: $FIRMWARE_URL"
           mkdir -p firmware
           cd firmware
           
-          # Download with resume support and show progress
-          wget --progress=bar:force:noscroll --tries=3 --timeout=60 "$FIRMWARE_URL" -O firmware.${{ env.FIRMWARE_TYPE }} 2>&1 | tail -20
+          if [ "${{ env.USE_ARIA2 }}" = "true" ]; then
+            echo "=== Downloading with aria2 (fast multi-connection) ==="
+            aria2c -x16 -s16 -k1M \
+              --max-connection-per-server=16 \
+              --min-split-size=1M \
+              --split=16 \
+              --max-tries=5 \
+              --retry-wait=5 \
+              --timeout=600 \
+              --max-download-limit=0 \
+              --allow-overwrite=true \
+              --auto-file-renaming=false \
+              --summary-interval=10 \
+              --console-log-level=notice \
+              --download-result=full \
+              --file-allocation=none \
+              -o firmware.${{ env.FIRMWARE_TYPE }} \
+              "${{ env.FIRMWARE_URL }}"
+          else
+            echo "=== Downloading with wget ==="
+            wget --progress=bar:force:noscroll \
+              --tries=5 \
+              --timeout=600 \
+              -O firmware.${{ env.FIRMWARE_TYPE }} \
+              "${{ env.FIRMWARE_URL }}"
+          fi
           
-          # Verify download
+          echo "=== Download complete ==="
           ls -lh firmware.${{ env.FIRMWARE_TYPE }}
           file firmware.${{ env.FIRMWARE_TYPE }}
           cd ..
 
-      - name: Run Phoenix Firmware Dumper (Docker)
+      - name: Run Phoenix Firmware Dumper
         run: |
-          # Pull the Phoenix Firmware Dumper Docker image
-          docker pull fr3akyphantom/phoenix_firmware_dumper:latest
+          cd phoenix_firmware_dumper
           
-          # Create output directory
-          mkdir -p extracted_firmware
+          echo "=== Starting firmware extraction ==="
+          echo "Source: ${{ env.FIRMWARE_URL }}"
+          echo "Type: ${{ env.FIRMWARE_TYPE }}"
           
           # Run the dumper with the firmware file
-          docker run --rm \
-            -v "$(pwd)/firmware:/input" \
-            -v "$(pwd)/extracted_firmware:/output" \
-            fr3akyphantom/phoenix_firmware_dumper:latest \
-            /input/firmware.${{ env.FIRMWARE_TYPE }}
+          ./dumper.sh "../firmware/firmware.${{ env.FIRMWARE_TYPE }}" 2>&1 | tee extraction.log
           
-          # List extracted contents
-          echo "=== Extracted Firmware Contents ==="
-          ls -la extracted_firmware/
-          find extracted_firmware/ -type f -name "*.img" -o -name "*.bin" | head -20
+          echo "=== Extraction complete ==="
+          ls -la
 
-      - name: Organize extracted files
+      - name: Organize extracted firmware
         run: |
-          cd extracted_firmware
+          echo "=== Organizing extracted files ==="
           
-          # Create structured output
+          # Find the output directory (usually created by phoenix dumper)
+          OUTPUT_DIR=$(find phoenix_firmware_dumper -maxdepth 2 -type d -name "*firmware*" -o -name "*extract*" | head -1)
+          if [ -z "$OUTPUT_DIR" ]; then
+            OUTPUT_DIR="phoenix_firmware_dumper"
+          fi
+          
+          # Create organized structure
           mkdir -p x659b_dump
           
-          # Move all image files to organized structure
-          find . -name "*.img" -o -name "*.bin" | while read file; do
-            mv "$file" x659b_dump/ 2>/dev/null || true
-          done
+          # Find and move all image files
+          find "$OUTPUT_DIR" -type f \( -name "*.img" -o -name "*.bin" -o -name "*.elf" \) -exec cp {} x659b_dump/ \; 2>/dev/null || true
           
-          # Create info file
+          # Find scatter file if exists
+          find "$OUTPUT_DIR" -name "*scatter*" -exec cp {} x659b_dump/ \; 2>/dev/null || true
+          
+          # Create README
           cat > x659b_dump/README.md << 'EOF'
           # Infinix Hot 10i X659B Firmware Dump
           
@@ -112,7 +238,7 @@ jobs:
           - And other essential partitions
           
           ## Extraction Method
-          Extracted using Phoenix Firmware Dumper (Docker)
+          Extracted using Phoenix Firmware Dumper (Direct Tool Mode)
           Source: ${{ env.FIRMWARE_URL }}
           
           ## Warning
@@ -120,65 +246,84 @@ jobs:
           Flashing incorrect firmware may brick your device.
           EOF
           
-          ls -la x659b_dump/
+          # Create info file with metadata
+          cat > x659b_dump/info.txt << EOF
+          Device: Infinix Hot 10i X659B
+          Chipset: MediaTek MT6768 (Helio P65)
+          Source: ${{ env.FIRMWARE_URL }}
+          Type: ${{ env.FIRMWARE_TYPE }}
+          Extraction Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          GitHub Run: ${{ github.run_id }}
+          EOF
+          
+          echo "=== Organized contents ==="
+          ls -lh x659b_dump/
 
-      - name: Create release archive
+      - name: Create archives
         run: |
-          cd extracted_firmware/x659b_dump
+          echo "=== Creating compressed archives ==="
           
-          # Create compressed archive
-          zip -r ../../infinix_x659b_firmware_dump.zip .
+          # Create zip archive
+          zip -r infinix_x659b_firmware_dump.zip x659b_dump/ -x "*.git*" -x "*/.git/*"
           
-          # Create tar.gz as alternative
-          cd ../..
-          tar -czf infinix_x659b_firmware_dump.tar.gz -C extracted_firmware/x659b_dump .
+          # Create tar.gz archive
+          tar -czf infinix_x659b_firmware_dump.tar.gz x659b_dump/
+          
+          # Create tar.xz archive (better compression)
+          tar -cJf infinix_x659b_firmware_dump.tar.xz x659b_dump/
           
           # Generate checksums
-          sha256sum infinix_x659b_firmware_dump.zip > checksums.txt
-          sha256sum infinix_x659b_firmware_dump.tar.gz >> checksums.txt
+          sha256sum infinix_x659b_firmware_dump.zip infinix_x659b_firmware_dump.tar.gz infinix_x659b_firmware_dump.tar.xz > checksums.txt
+          md5sum infinix_x659b_firmware_dump.zip infinix_x659b_firmware_dump.tar.gz infinix_x659b_firmware_dump.tar.xz >> checksums.txt
           
-          ls -lh infinix_x659b_firmware_dump.*
+          echo "=== Archives created ==="
+          ls -lh *.zip *.tar.* *.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: x659b-firmware-dump
           path: |
-            extracted_firmware/x659b_dump/
+            x659b_dump/
             infinix_x659b_firmware_dump.zip
             infinix_x659b_firmware_dump.tar.gz
             checksums.txt
           retention-days: 5
-          compression-level: 0  # Already compressed
+          compression-level: 0
 
-      - name: Create Release
+      - name: Create GitHub Release
         if: github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: x659b-dump-${{ github.run_number }}
+          tag_name: x659b-dump-${{ github.run_number }}-${{ github.run_attempt }}
           name: Infinix Hot 10i X659B Firmware Dump #${{ github.run_number }}
           body: |
-            Automated firmware extraction for Infinix Hot 10i X659B
+            ## Infinix Hot 10i X659B Firmware Extraction
             
             **Source:** ${{ env.FIRMWARE_URL }}
-            **Type:** ${{ env.FIRMWARE_TYPE }}
+            **File Type:** ${{ env.FIRMWARE_TYPE }}
+            **Download Method:** ${{ env.USE_ARIA2 == 'true' && 'aria2 (16 connections)' || 'wget' }}
             **Extraction Date:** ${{ github.event.repository.updated_at }}
             
-            ### Contents
-            - Individual partition images (.img/.bin)
-            - ZIP archive of all partitions
-            - TAR.GZ archive of all partitions
-            - SHA256 checksums
+            ### Device Information
+            - **Model:** Infinix Hot 10i (X659B)
+            - **Chipset:** MediaTek MT6768 (Helio P65)
+            - **Android:** 11 (Go Edition)
             
-            ### Device Info
-            - Model: Infinix Hot 10i (X659B)
-            - Chipset: MediaTek MT6768 (Helio P65)
-            - Android: 11 (Go Edition)
+            ### Archives Available
+            - `infinix_x659b_firmware_dump.zip` - Standard zip archive
+            - `infinix_x659b_firmware_dump.tar.gz` - Gzip compressed tar
+            - `infinix_x659b_firmware_dump.tar.xz` - XZ compressed tar (smallest)
+            - Individual partition files in `x659b_dump/`
+            
+            ### Checksums
+            See `checksums.txt` for SHA256 and MD5 hashes.
             
             ⚠️ **Warning:** Use at your own risk. Verify compatibility before flashing.
           files: |
             infinix_x659b_firmware_dump.zip
             infinix_x659b_firmware_dump.tar.gz
+            infinix_x659b_firmware_dump.tar.xz
             checksums.txt
           draft: false
           prerelease: false
@@ -188,5 +333,6 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker system prune -f
-          rm -rf firmware extracted_firmware
+          echo "=== Cleaning up ==="
+          rm -rf firmware phoenix_firmware_dumper x659b_dump
+          df -h
