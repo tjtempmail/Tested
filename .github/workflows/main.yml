@@ -1,173 +1,192 @@
-name: Extract Info from boot.img (Android 11 - Final)
+name: Infinix X659B Firmware Dump
 
 on:
   workflow_dispatch:
     inputs:
-      bootimg_url:
-        description: 'Direct URL to stock boot.img (e.g., from Google Drive)'
+      firmware_url:
+        description: 'Direct URL to firmware file (zip/ozip/payload.bin)'
         required: true
+        default: 'https://archive.org/download/infinix-hot-10i-x659b-stock-rom-firmware/R2-Infinix-Hot-10i-X659B-14.zip'
         type: string
+      firmware_type:
+        description: 'Firmware file type'
+        required: true
+        default: 'zip'
+        type: choice
+        options:
+          - zip
+          - ozip
+          - payload.bin
+          - super.img
+          - UPDATE.APP
+          - pac
+          - ofp
+          - nb0
+
+env:
+  FIRMWARE_URL: ${{ github.event.inputs.firmware_url }}
+  FIRMWARE_TYPE: ${{ github.event.inputs.firmware_type }}
 
 jobs:
-  extract-info:
-    runs-on: ubuntu-22.04
-
+  dump-firmware:
+    runs-on: ubuntu-latest
+    
     steps:
-      - name: Checkout dummy repo
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Install dependencies
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+
+      - name: Free up disk space
         run: |
-          sudo apt update
-          sudo apt install -y \
-            wget curl \
-            device-tree-compiler \
-            cpio \
-            binutils \
-            file \
-            lz4 \
-            xz-utils
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+          df -h
 
-      - name: Clone and build mkbootimg (for unpackbootimg)
+      - name: Download firmware
         run: |
-          git clone https://github.com/osm0sis/mkbootimg.git
-          cd mkbootimg
-          make
-          echo "$(pwd)" >> $GITHUB_PATH
+          echo "Downloading firmware from: $FIRMWARE_URL"
+          mkdir -p firmware
+          cd firmware
+          
+          # Download with resume support and show progress
+          wget --progress=bar:force:noscroll --tries=3 --timeout=60 "$FIRMWARE_URL" -O firmware.${{ env.FIRMWARE_TYPE }} 2>&1 | tail -20
+          
+          # Verify download
+          ls -lh firmware.${{ env.FIRMWARE_TYPE }}
+          file firmware.${{ env.FIRMWARE_TYPE }}
+          cd ..
 
-      - name: Download boot.img from provided URL
+      - name: Run Phoenix Firmware Dumper (Docker)
         run: |
-          wget -O stock-boot.img "${{ inputs.bootimg_url }}"
-          echo "Downloaded file size: $(du -h stock-boot.img | cut -f1)"
-          file stock-boot.img
+          # Pull the Phoenix Firmware Dumper Docker image
+          docker pull fr3akyphantom/phoenix_firmware_dumper:latest
+          
+          # Create output directory
+          mkdir -p extracted_firmware
+          
+          # Run the dumper with the firmware file
+          docker run --rm \
+            -v "$(pwd)/firmware:/input" \
+            -v "$(pwd)/extracted_firmware:/output" \
+            fr3akyphantom/phoenix_firmware_dumper:latest \
+            /input/firmware.${{ env.FIRMWARE_TYPE }}
+          
+          # List extracted contents
+          echo "=== Extracted Firmware Contents ==="
+          ls -la extracted_firmware/
+          find extracted_firmware/ -type f -name "*.img" -o -name "*.bin" | head -20
 
-      - name: Create output directory
-        run: mkdir -p output
-
-      - name: Unpack boot.img with unpackbootimg
+      - name: Organize extracted files
         run: |
-          mkdir -p boot_unpacked
-          unpackbootimg -i stock-boot.img -o boot_unpacked/
-          ls -la boot_unpacked/
-          cp boot_unpacked/* output/ 2>/dev/null || true
+          cd extracted_firmware
+          
+          # Create structured output
+          mkdir -p x659b_dump
+          
+          # Move all image files to organized structure
+          find . -name "*.img" -o -name "*.bin" | while read file; do
+            mv "$file" x659b_dump/ 2>/dev/null || true
+          done
+          
+          # Create info file
+          cat > x659b_dump/README.md << 'EOF'
+          # Infinix Hot 10i X659B Firmware Dump
+          
+          **Device:** Infinix Hot 10i  
+          **Model:** X659B  
+          **Chipset:** MediaTek MT6768 (Helio P65)  
+          **Android Version:** 11 (Go Edition)  
+          
+          ## Contents
+          This firmware dump contains the following partitions:
+          - boot.img - Kernel image
+          - super.img - System partitions (system, vendor, product)
+          - preloader.bin - Bootloader
+          - vbmeta.img - Verified boot metadata
+          - dtbo.img - Device tree blob
+          - And other essential partitions
+          
+          ## Extraction Method
+          Extracted using Phoenix Firmware Dumper (Docker)
+          Source: ${{ env.FIRMWARE_URL }}
+          
+          ## Warning
+          These files are for educational and backup purposes only.
+          Flashing incorrect firmware may brick your device.
+          EOF
+          
+          ls -la x659b_dump/
 
-      - name: Extract kernel command line
+      - name: Create release archive
         run: |
-          if [ -f boot_unpacked/stock-boot.img-cmdline ]; then
-            cat boot_unpacked/stock-boot.img-cmdline > output/cmdline.txt
-            echo "Kernel command line:"
-            cat output/cmdline.txt
-          else
-            echo "No cmdline file found" > output/cmdline.txt
-          fi
+          cd extracted_firmware/x659b_dump
+          
+          # Create compressed archive
+          zip -r ../../infinix_x659b_firmware_dump.zip .
+          
+          # Create tar.gz as alternative
+          cd ../..
+          tar -czf infinix_x659b_firmware_dump.tar.gz -C extracted_firmware/x659b_dump .
+          
+          # Generate checksums
+          sha256sum infinix_x659b_firmware_dump.zip > checksums.txt
+          sha256sum infinix_x659b_firmware_dump.tar.gz >> checksums.txt
+          
+          ls -lh infinix_x659b_firmware_dump.*
 
-      - name: Extract base address and pagesize
-        run: |
-          if [ -f boot_unpacked/stock-boot.img-base ]; then
-            cp boot_unpacked/stock-boot.img-base output/base.txt
-            echo "Base address: $(cat output/base.txt)"
-          fi
-          if [ -f boot_unpacked/stock-boot.img-pagesize ]; then
-            cp boot_unpacked/stock-boot.img-pagesize output/pagesize.txt
-            echo "Pagesize: $(cat output/pagesize.txt)"
-          fi
-
-      - name: Extract kernel version from kernel image
-        run: |
-          if [ -f boot_unpacked/stock-boot.img-kernel ]; then
-            cp boot_unpacked/stock-boot.img-kernel output/kernel
-            strings boot_unpacked/stock-boot.img-kernel | grep -E '^Linux version [0-9]' | head -1 > output/kernel_version.txt
-            if [ -s output/kernel_version.txt ]; then
-              echo "Kernel version:"
-              cat output/kernel_version.txt
-            else
-              echo "Could not extract kernel version" > output/kernel_version.txt
-            fi
-          else
-            echo "No kernel file" > output/kernel_version.txt
-          fi
-
-      - name: Analyze DTB file (try multiple methods)
-        run: |
-          if [ -f boot_unpacked/stock-boot.img-dtb ]; then
-            cp boot_unpacked/stock-boot.img-dtb output/original.dtb
-            echo "DTB file size: $(du -h output/original.dtb | cut -f1)" > output/dtb_analysis.txt
-            file output/original.dtb >> output/dtb_analysis.txt
-            
-            # Method 1: Try dtc conversion
-            echo "=== dtc conversion attempt ===" >> output/dtb_analysis.txt
-            dtc -I dtb -O dts -o output/stock.dts output/original.dtb 2>> output/dtb_analysis.txt || echo "dtc failed" >> output/dtb_analysis.txt
-            
-            # Method 2: Try fdtdump
-            echo "=== fdtdump output (first 50 lines) ===" >> output/dtb_analysis.txt
-            fdtdump output/original.dtb 2>/dev/null | head -50 >> output/dtb_analysis.txt
-            
-            # Method 3: Extract strings from DTB (often contains model/compatible)
-            echo "=== strings from DTB ===" >> output/dtb_analysis.txt
-            strings -n 8 output/original.dtb | grep -E "model|compatible|mediatek|infinix" | head -20 >> output/dtb_analysis.txt
-            
-            # Method 4: Hexdump first 256 bytes
-            echo "=== hexdump first 256 bytes ===" >> output/dtb_analysis.txt
-            hexdump -C -n 256 output/original.dtb >> output/dtb_analysis.txt
-          else
-            echo "No DTB file found" > output/dtb_analysis.txt
-          fi
-
-      - name: Extract ramdisk contents
-        run: |
-          if [ -f boot_unpacked/stock-boot.img-ramdisk ]; then
-            cp boot_unpacked/stock-boot.img-ramdisk output/ramdisk.cpio.gz
-            mkdir -p ramdisk_root
-            cd ramdisk_root
-            # Try to decompress if it's gzipped
-            if file ../output/ramdisk.cpio.gz | grep -q gzip; then
-              gunzip -c ../output/ramdisk.cpio.gz | cpio -i -d -m --quiet 2>/dev/null || echo "cpio extraction failed" > ../output/ramdisk_error.txt
-            else
-              cpio -i -d -m --quiet < ../output/ramdisk.cpio.gz 2>/dev/null || echo "cpio extraction failed" > ../output/ramdisk_error.txt
-            fi
-            cd ..
-            echo "Ramdisk contents (top-level):" > output/ramdisk_list.txt
-            ls -la ramdisk_root/ >> output/ramdisk_list.txt 2>/dev/null
-            # Check for init, default.prop, etc.
-            [ -f ramdisk_root/init ] && echo "init found" >> output/ramdisk_list.txt
-            [ -f ramdisk_root/default.prop ] && head -5 ramdisk_root/default.prop >> output/ramdisk_list.txt
-            # Archive ramdisk for download
-            tar -czf output/ramdisk_extracted.tar.gz -C ramdisk_root . 2>/dev/null || true
-          else
-            echo "No ramdisk found" > output/ramdisk_list.txt
-          fi
-
-      - name: Generate summary info
-        run: |
-          {
-            echo "BOOT.IMG INFO SUMMARY"
-            echo "====================="
-            echo "File size: $(du -h stock-boot.img | cut -f1)"
-            echo ""
-            echo "--- Kernel ---"
-            cat output/kernel_version.txt
-            echo ""
-            echo "--- Command Line ---"
-            cat output/cmdline.txt
-            echo ""
-            echo "--- Base Address ---"
-            cat output/base.txt
-            echo "--- Pagesize ---"
-            cat output/pagesize.txt
-            echo ""
-            echo "--- Device Tree Analysis ---"
-            cat output/dtb_analysis.txt
-            echo ""
-            echo "--- Ramdisk Top Files ---"
-            cat output/ramdisk_list.txt
-          } > output/INFO.txt
-
-      - name: Upload all extracted info as artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: bootimg-info-android11-final
+          name: x659b-firmware-dump
           path: |
-            output/
-            boot_unpacked/
+            extracted_firmware/x659b_dump/
+            infinix_x659b_firmware_dump.zip
+            infinix_x659b_firmware_dump.tar.gz
+            checksums.txt
+          retention-days: 5
+          compression-level: 0  # Already compressed
+
+      - name: Create Release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: x659b-dump-${{ github.run_number }}
+          name: Infinix Hot 10i X659B Firmware Dump #${{ github.run_number }}
+          body: |
+            Automated firmware extraction for Infinix Hot 10i X659B
+            
+            **Source:** ${{ env.FIRMWARE_URL }}
+            **Type:** ${{ env.FIRMWARE_TYPE }}
+            **Extraction Date:** ${{ github.event.repository.updated_at }}
+            
+            ### Contents
+            - Individual partition images (.img/.bin)
+            - ZIP archive of all partitions
+            - TAR.GZ archive of all partitions
+            - SHA256 checksums
+            
+            ### Device Info
+            - Model: Infinix Hot 10i (X659B)
+            - Chipset: MediaTek MT6768 (Helio P65)
+            - Android: 11 (Go Edition)
+            
+            ⚠️ **Warning:** Use at your own risk. Verify compatibility before flashing.
+          files: |
+            infinix_x659b_firmware_dump.zip
+            infinix_x659b_firmware_dump.tar.gz
+            checksums.txt
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker system prune -f
+          rm -rf firmware extracted_firmware
