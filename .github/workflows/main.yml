@@ -1,352 +1,509 @@
-name: Infinix X659B Firmware Dump (Direct Tool)
+name: X659B Firmware Extractor - Dynamic Partitions
 
 on:
   workflow_dispatch:
     inputs:
-      firmware_url:
-        description: 'Direct URL to firmware file (zip/ozip/payload.bin)'
+      upload_to_telegram:
+        description: 'Upload dump to Telegram'
+        required: false
+        default: 'false'
+        type: boolean
+      upload_to_github:
+        description: 'Create GitHub Release'
+        required: false
+        default: 'true'
+        type: boolean
+      extract_mode:
+        description: 'Extraction mode'
         required: true
-        default: 'https://archive.org/download/infinix-hot-10i-x659b-stock-rom-firmware/R2-Infinix-Hot-10i-X659B-14.zip'
-        type: string
-      firmware_type:
-        description: 'Firmware file type'
-        required: true
-        default: 'zip'
+        default: 'full'
         type: choice
         options:
-          - zip
-          - ozip
-          - payload.bin
-          - super.img
-          - UPDATE.APP
-          - pac
-          - ofp
-          - nb0
+          - full
+          - super_only
+          - boot_only
 
 env:
-  FIRMWARE_URL: ${{ github.event.inputs.firmware_url }}
-  FIRMWARE_TYPE: ${{ github.event.inputs.firmware_type }}
+  FIRMWARE_URL: "https://archive.org/download/infinix-hot-10i-x659b-stock-rom-firmware/R2-Infinix-Hot-10i-X659B-14.zip"
+  FIRMWARE_FILENAME: "R2-Infinix-Hot-10i-X659B-14.zip"
+  WORK_DIR: ${{ github.workspace }}/firmware_work
+  DUMP_DIR: ${{ github.workspace }}/dump_output
+  DEVICE_CODENAME: "X659B"
+  DEVICE_NAME: "Infinix Hot 10i"
+  CHIPSET: "MT6768"
 
 jobs:
-  dump-firmware:
+  firmware-process:
     runs-on: ubuntu-22.04
+    timeout-minutes: 180
     
     steps:
-      - name: Checkout repository
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 1024
+          swap-size-mb: 2048
+          remove-dotnet: 'true'
+          remove-haskell: 'true'
+          remove-android: 'true'
+          remove-codeql: 'true'
+
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install Dependencies & Tools
         run: |
-          echo "=== Installing System Dependencies ==="
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
+          sudo apt-get update
+          sudo apt-get install -y \
             aria2 \
-            wget \
-            curl \
-            git \
-            python3 \
-            python3-pip \
-            python3-venv \
             p7zip-full \
             p7zip-rar \
             unzip \
-            tar \
-            gzip \
-            xz-utils \
-            lz4 \
+            unrar \
+            liblz4-tool \
             brotli \
             simg2img \
-            liblz4-tool \
-            libmagickwand-dev \
-            unace \
-            unrar \
-            zip \
-            file \
-            zstd \
+            img2simg \
+            e2fsprogs \
             qemu-utils \
-            qemu-user-static \
-            binwalk \
+            kpartx \
             sleuthkit \
-            android-sdk-libsparse-utils \
-            libxml2 \
-            libxml2-dev \
-            libxslt1-dev \
-            libffi-dev \
-            libssl-dev \
-            zlib1g-dev \
-            build-essential \
-            cmake \
-            clang \
-            pkg-config \
-            libz-dev \
-            libbz2-dev \
-            libreadline-dev \
-            libsqlite3-dev \
-            libncursesw5-dev \
-            xz-utils \
-            tk-dev \
-            libxml2-dev \
-            libxmlsec1-dev \
-            libffi-dev \
-            liblzma-dev \
-            patchelf \
-            2>&1 | grep -v "debconf\|Selecting\|Preparing\|Unpacking\|Setting up\|Processing\|Scanning\|Building" || true
+            binwalk \
+            python3 \
+            python3-pip \
+            git \
+            curl \
+            wget \
+            file \
+            tree \
+            pv \
+            bc \
+            jq \
+            cpio \
+            xz-utils
 
-          echo "=== Verifying aria2 installation ==="
-          aria2c --version | head -3
-
-          echo "=== Installing Python packages ==="
-          pip3 install -q --upgrade pip setuptools wheel
-          pip3 install -q \
-            backports.lzma \
-            docopt \
-            protobuf \
-            pycryptodome \
-            six \
-            requests \
-            beautifulsoup4 \
-            lxml \
-            html5lib \
-            2>&1 | tail -5 || true
-
-          echo "=== Installing Payload Dumper Go ==="
-          wget -q https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
-          tar -xzf payload-dumper-go_1.2.2_linux_amd64.tar.gz
-          chmod +x payload-dumper-go
-          sudo mv payload-dumper-go /usr/local/bin/
-          rm payload-dumper-go_1.2.2_linux_amd64.tar.gz
-          echo "Payload Dumper Go installed"
-          payload-dumper-go -h | head -5
-
-          echo "=== Cloning Phoenix Firmware Dumper ==="
-          git clone --depth 1 https://github.com/DroidDumps/phoenix_firmware_dumper.git
-          cd phoenix_firmware_dumper
+          # Install sdat2img for .dat conversion
+          pip3 install --user protobuf bsdiff4
           
-          echo "=== Running Phoenix Setup ==="
-          chmod +x setup.sh
-          # Skip git clone errors in setup.sh by running with error tolerance
-          ./setup.sh 2>&1 | tail -30 || true
-          
-          echo "=== Setup Complete ==="
-          ls -la
+          # Download sdat2img
+          wget -q https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py -O /usr/local/bin/sdat2img.py
+          chmod +x /usr/local/bin/sdat2img.py
 
-      - name: Free up disk space
+      - name: Create Working Directories
         run: |
-          echo "=== Cleaning up disk space ==="
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune -af 2>/dev/null || true
-          sudo apt-get clean
-          df -h
+          mkdir -p ${{ env.WORK_DIR }}
+          mkdir -p ${{ env.DUMP_DIR }}
+          mkdir -p ${{ github.workspace }}/tools
 
-      - name: Download firmware with aria2
+      - name: Download Firmware with Aria2 (Optimized)
+        working-directory: ${{ env.WORK_DIR }}
         run: |
-          mkdir -p firmware
-          cd firmware
+          echo "🚀 Starting optimized download for X659B firmware..."
+          echo "Device: ${{ env.DEVICE_NAME }} (${{ env.DEVICE_CODENAME }})"
+          echo "Chipset: ${{ env.CHIPSET }}"
           
-          echo "=== Downloading with aria2 (fast multi-connection) ==="
-          aria2c -x16 -s16 -k1M \
-            --max-connection-per-server=16 \
-            --min-split-size=1M \
-            --split=16 \
-            --max-tries=5 \
-            --retry-wait=5 \
-            --timeout=600 \
-            --max-download-limit=0 \
-            --allow-overwrite=true \
-            --auto-file-renaming=false \
-            --summary-interval=10 \
+          # Create optimized aria2 config
+          cat > aria2.conf << 'EOF'
+          # High-performance settings for large firmware
+          max-connection-per-server=16
+          min-split-size=20M
+          split=32
+          max-concurrent-downloads=3
+          
+          # Robust retry settings
+          timeout=600
+          retry-wait=10
+          max-tries=5
+          continue=true
+          remote-time=true
+          
+          # Performance optimizations
+          file-allocation=trunc
+          disk-cache=128M
+          enable-http-pipelining=true
+          enable-http-keep-alive=true
+          http-accept-gzip=true
+          
+          # Logging
+          log-level=notice
+          summary-interval=15
+          
+          # Checksum verification
+          check-integrity=true
+          EOF
+          
+          # Download with progress
+          aria2c --conf-path=aria2.conf \
+            --dir=${{ env.WORK_DIR }} \
+            --out=${{ env.FIRMWARE_FILENAME }} \
             --console-log-level=notice \
-            --download-result=full \
-            --file-allocation=none \
-            -o firmware.${{ env.FIRMWARE_TYPE }} \
             "${{ env.FIRMWARE_URL }}"
           
-          echo "=== Download complete ==="
-          ls -lh firmware.${{ env.FIRMWARE_TYPE }}
-          file firmware.${{ env.FIRMWARE_TYPE }}
-          cd ..
+          echo "✅ Download complete!"
+          ls -lh ${{ env.FIRMWARE_FILENAME }}
+          file ${{ env.FIRMWARE_FILENAME }}
+          echo "MD5: $(md5sum ${{ env.FIRMWARE_FILENAME }} | cut -d' ' -f1)"
+
+      - name: Extract Firmware Archive
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          echo "📦 Extracting firmware archive..."
+          mkdir -p extracted_rom
+          
+          # Extract with 7z (best for large archives)
+          7z x ${{ env.FIRMWARE_FILENAME }} -oextracted_rom -y -bb1
+          
+          echo "✅ Extraction complete. ROM structure:"
+          tree -L 2 extracted_rom/ || find extracted_rom/ -type f -name "*.img" -o -name "*.bin" | head -20
+          
+          # List all files with sizes
+          echo "📊 Firmware contents:"
+          find extracted_rom/ -type f -exec ls -lh {} \; | awk '{ print $9 ": " $5 }'
+
+      - name: Process Super.img (Dynamic Partitions)
+        working-directory: ${{ env.WORK_DIR }}/extracted_rom
+        run: |
+          echo "🔧 Processing Dynamic Partitions (super.img)..."
+          
+          # Find super.img
+          SUPER_IMG=$(find . -name "super.img" -type f | head -1)
+          
+          if [ -z "$SUPER_IMG" ]; then
+            echo "❌ super.img not found!"
+            exit 1
+          fi
+          
+          echo "Found: $SUPER_IMG"
+          ls -lh "$SUPER_IMG"
+          file "$SUPER_IMG"
+          
+          # Convert sparse super.img to raw if needed
+          if file "$SUPER_IMG" | grep -q "sparse"; then
+            echo "Converting sparse super.img to raw format..."
+            simg2img "$SUPER_IMG" super_raw.img
+            SUPER_IMG="super_raw.img"
+            echo "✅ Converted to raw: super_raw.img ($(ls -lh super_raw.img | awk '{print $5}'))"
+          else
+            cp "$SUPER_IMG" super_raw.img
+            SUPER_IMG="super_raw.img"
+          fi
+          
+          # Extract partitions using lpunpack
+          echo "🔍 Extracting logical partitions from super..."
+          
+          # Get lpunpack from phoenix dumper later, or use standalone
+          mkdir -p super_extracted
+          
+          # Try to extract with imjtool first (shows partition table)
+          wget -q http://newandroidbook.com/tools/imjtool.tgz -O imjtool.tgz
+          tar -xzf imjtool.tgz
+          
+          echo "Partition layout:"
+          ./imjtool.ELF64 "$SUPER_IMG" info 2>/dev/null || echo "imjtool info failed, continuing..."
+          
+          # Extract all partitions
+          ./imjtool.ELF64 "$SUPER_IMG" extract 2>/dev/null || echo "imjtool extract failed"
+          
+          # If imjtool worked, move extracted files
+          if [ -d "extracted" ]; then
+            mv extracted/* super_extracted/ 2>/dev/null || true
+          fi
+          
+          # List extracted partitions
+          echo "✅ Extracted partitions:"
+          ls -lh super_extracted/ || echo "No partitions extracted yet"
+
+      - name: Clone & Setup Phoenix Firmware Dumper
+        run: |
+          echo "🐦 Setting up Phoenix Firmware Dumper..."
+          git clone --depth 1 https://github.com/DroidDumps/phoenix_firmware_dumper.git ${{ github.workspace }}/phoenix_dumper
+          cd ${{ github.workspace }}/phoenix_dumper
+          
+          # Run setup
+          chmod +x setup.sh dumper.sh
+          ./setup.sh
+          
+          # Verify lpunpack is available
+          which lpunpack || find . -name "lpunpack" -type f
+          
+          echo "✅ Phoenix Dumper ready"
+
+      - name: Extract Partitions with lpunpack
+        working-directory: ${{ env.WORK_DIR }}/extracted_rom
+        run: |
+          echo "🔧 Using lpunpack to extract dynamic partitions..."
+          
+          LPUNPACK="${{ github.workspace }}/phoenix_dumper/tools/lpunpack"
+          
+          if [ ! -f "$LPUNPACK" ]; then
+            # Build or download lpunpack if not found
+            echo "lpunpack not found in tools, downloading..."
+            wget -q https://github.com/northumber/android-partition-tools_prebuilt_binaries/releases/download/v1.0/lpunpack -O lpunpack
+            chmod +x lpunpack
+            LPUNPACK="./lpunpack"
+          fi
+          
+          # Extract specific partitions
+          PARTITIONS="system system_ext product vendor odm"
+          
+          for partition in $PARTITIONS; do
+            echo "Extracting ${partition}_a..."
+            $LPUNPACK --partition=${partition}_a super_raw.img super_extracted/ 2>/dev/null || \
+            $LPUNPACK --partition=${partition} super_raw.img super_extracted/ 2>/dev/null || \
+            echo "⚠️ Could not extract $partition"
+          done
+          
+          echo "✅ Partition extraction complete"
+          ls -lh super_extracted/
+
+      - name: Deep Extract System.img Contents
+        working-directory: ${{ env.WORK_DIR }}/extracted_rom/super_extracted
+        run: |
+          echo "🔍 Deep extracting system.img contents..."
+          
+          # Find system image (could be system.img or system_a.img)
+          SYSTEM_IMG=$(find . -name "system*.img" -type f | grep -v raw | head -1)
+          
+          if [ -n "$SYSTEM_IMG" ]; then
+            echo "Processing: $SYSTEM_IMG ($(ls -lh $SYSTEM_IMG | awk '{print $5}'))"
+            
+            # Convert if sparse
+            if file "$SYSTEM_IMG" | grep -q "sparse"; then
+              simg2img "$SYSTEM_IMG" system_raw.img
+              SYSTEM_IMG="system_raw.img"
+            fi
+            
+            # Create mount point and extract
+            mkdir -p system_mount system_files
+            sudo mount -o loop,ro "$SYSTEM_IMG" system_mount 2>/dev/null && {
+              echo "✅ Mounted system.img, copying files..."
+              sudo cp -a system_mount/* system_files/
+              sudo umount system_mount
+              echo "System files extracted: $(find system_files/ -type f | wc -l) files"
+            } || {
+              echo "⚠️ Could not mount system.img (may need different approach)"
+              # Try 7z extraction as fallback
+              7z x "$SYSTEM_IMG" -osystem_7z -y 2>/dev/null || true
+            }
+          else
+            echo "⚠️ No system.img found in extracted partitions"
+          fi
+          
+          # Do the same for vendor
+          VENDOR_IMG=$(find . -name "vendor*.img" -type f | head -1)
+          if [ -n "$VENDOR_IMG" ]; then
+            echo "Processing vendor: $VENDOR_IMG"
+            mkdir -p vendor_mount vendor_files
+            file "$VENDOR_IMG"
+            if file "$VENDOR_IMG" | grep -q "sparse"; then
+              simg2img "$VENDOR_IMG" vendor_raw.img
+              VENDOR_IMG="vendor_raw.img"
+            fi
+            sudo mount -o loop,ro "$VENDOR_IMG" vendor_mount 2>/dev/null && {
+              sudo cp -a vendor_mount/* vendor_files/
+              sudo umount vendor_mount
+            } || true
+          fi
 
       - name: Run Phoenix Firmware Dumper
+        working-directory: ${{ github.workspace }}/phoenix_dumper
         run: |
-          cd phoenix_firmware_dumper
+          echo "🚀 Running Phoenix Firmware Dumper on extracted firmware..."
           
-          echo "=== Starting firmware extraction ==="
-          echo "Source: ${{ env.FIRMWARE_URL }}"
-          echo "Type: ${{ env.FIRMWARE_TYPE }}"
+          # Prepare credentials
+          if [ "${{ github.event.inputs.upload_to_github }}" = "true" ]; then
+            echo "${{ secrets.GITHUB_TOKEN }}" > .github_token
+            echo "${{ github.repository_owner }}" > .github_orgname
+          fi
           
-          # Run the dumper with the firmware file
-          ./dumper.sh "../firmware/firmware.${{ env.FIRMWARE_TYPE }}" 2>&1 | tee extraction.log || true
+          if [ "${{ github.event.inputs.upload_to_telegram }}" = "true" ]; then
+            echo "${{ secrets.TELEGRAM_BOT_TOKEN }}" > .tg_token
+            echo "${{ secrets.TELEGRAM_CHAT_ID }}" > .tg_chat
+          fi
           
-          echo "=== Extraction complete ==="
-          ls -la
+          # Run dumper on the extracted ROM directory
+          FIRMWARE_PATH="${{ env.WORK_DIR }}/extracted_rom"
+          
+          ./dumper.sh "$FIRMWARE_PATH" 2>&1 | tee ${{ github.workspace }}/phoenix_dump.log || {
+            echo "⚠️ Phoenix dumper had issues, trying direct super.img..."
+            ./dumper.sh "${{ env.WORK_DIR }}/extracted_rom/super_raw.img" 2>&1 | tee -a ${{ github.workspace }}/phoenix_dump.log || true
+          }
+          
+          # Copy any outputs
+          if [ -d "output" ]; then
+            cp -r output/* ${{ env.DUMP_DIR }}/ 2>/dev/null || true
+          fi
 
-      - name: Organize extracted firmware
+      - name: Process Boot Images (Kernel & DTB)
+        working-directory: ${{ env.WORK_DIR }}/extracted_rom
         run: |
-          echo "=== Organizing extracted files ==="
+          echo "🔧 Processing boot images..."
           
-          # Find the output directory (phoenix dumper usually creates a folder based on filename)
-          OUTPUT_DIR=$(find . -maxdepth 2 -type d -name "*firmware*" -o -name "*extract*" -o -name "*dump*" | grep -v "phoenix_firmware_dumper" | head -1)
-          if [ -z "$OUTPUT_DIR" ] || [ ! -d "$OUTPUT_DIR" ]; then
-            # Check inside phoenix dumper
-            OUTPUT_DIR=$(find phoenix_firmware_dumper -maxdepth 2 -type d | grep -v ".git" | tail -1)
+          mkdir -p ${{ env.DUMP_DIR }}/boot_analysis
+          
+          for boot in boot_a.img boot.img; do
+            if [ -f "$boot" ]; then
+              echo "Analyzing: $boot"
+              
+              # Extract with 7z first
+              mkdir -p ${boot}_extracted
+              7z x "$boot" -o${boot}_extracted -y 2>/dev/null || true
+              
+              # Use unpackbootimg if available
+              if command -v unpackbootimg &> /dev/null; then
+                unpackbootimg -i "$boot" -o ${boot}_unpacked 2>/dev/null || true
+              fi
+              
+              # Copy kernel and ramdisk
+              cp ${boot}_extracted/kernel* ${{ env.DUMP_DIR }}/boot_analysis/ 2>/dev/null || true
+              cp ${boot}_extracted/ramdisk* ${{ env.DUMP_DIR }}/boot_analysis/ 2>/dev/null || true
+            fi
+          done
+          
+          # Process dtbo
+          if [ -f "dtbo_a.img" ]; then
+            echo "Processing dtbo_a.img..."
+            mkdir -p dtbo_extracted
+            7z x dtbo_a.img -odtbo_extracted -y 2>/dev/null || true
           fi
+
+      -: Generate Comprehensive Report
+        working-directory: ${{ env.DUMP_DIR }}
+        run: |
+          echo "📊 Generating comprehensive dump report..."
           
-          if [ -z "$OUTPUT_DIR" ] || [ ! -d "$OUTPUT_DIR" ]; then
-            echo "No specific output dir found, using current directory contents"
-            OUTPUT_DIR="."
-          fi
+          cat > X659B_DUMP_REPORT.md << 'EOF'
+          # Infinix Hot 10i (X659B) Firmware Dump Report
           
-          echo "Using output directory: $OUTPUT_DIR"
+          ## Device Information
+          - **Device:** Infinix Hot 10i
+          - **Model:** X659B-OP
+          - **Codename:** X659B
+          - **Chipset:** MediaTek MT6768 (Helio P65)
+          - **Architecture:** ARM64 (arm64-v8a)
+          - **Android Version:** 11 (API 30)
+          - **Firmware:** R2-Infinix-Hot-10i-X659B-14
+          
+          ## Hardware Specifications
+          - **CPU:** 6× Cortex-A55 @ 500-1700 MHz + 2× Cortex-A75 @ 850-2000 MHz
+          - **GPU:** Mali-G52 MC2
+          - **RAM:** 4 GB LPDDR4X
+          - **Storage:** 128 GB
+          - **Display:** 720×1600 (HD+), 6.52", 60Hz
+          - **Battery:** 6000 mAh
+          
+          ## Partition Layout (Dynamic Partitions)
+          This device uses Android Dynamic Partitions (super.img).
+          
+          ## Extraction Details
+          EOF
+          
+          echo "- **Extraction Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> X659B_DUMP_REPORT.md
+          echo "- **GitHub Run:** ${{ github.run_number }}" >> X659B_DUMP_REPORT.md
+          echo "" >> X659B_DUMP_REPORT.md
+          
+          echo "## Extracted Partitions" >> X659B_DUMP_REPORT.md
+          echo "" >> X659B_DUMP_REPORT.md
+          echo "| Partition | Size | Type |" >> X659B_DUMP_REPORT.md
+          echo "|-----------|------|------|" >> X659B_DUMP_REPORT.md
+          
+          # Add partition info
+          for img in ${{ env.WORK_DIR }}/extracted_rom/super_extracted/*.img; do
+            if [ -f "$img" ]; then
+              name=$(basename "$img")
+              size=$(ls -lh "$img" | awk '{print $5}')
+              type=$(file "$img" | cut -d':' -f2 | xargs)
+              echo "| $name | $size | $type |" >> X659B_DUMP_REPORT.md
+            fi
+          done
+          
+          echo "" >> X659B_DUMP_REPORT.md
+          echo "## File Tree" >> X659B_DUMP_REPORT.md
+          echo "\`\`\`" >> X659B_DUMP_REPORT.md
+          tree -L 3 ${{ env.WORK_DIR }}/extracted_rom/super_extracted/ >> X659B_DUMP_REPORT.md 2>/dev/null || \
+          find ${{ env.WORK_DIR }}/extracted_rom/super_extracted/ -type f | head -50 >> X659B_DUMP_REPORT.md
+          echo "\`\`\`" >> X659B_DUMP_REPORT.md
+          
+          cat X659B_DUMP_REPORT.md
+
+      - name: Package & Compress Output
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "📦 Packaging dump output..."
           
           # Create organized structure
-          mkdir -p x659b_dump
+          mkdir -p final_dump/X659B_firmware_dump
           
-          # Find and copy all image/bin files
-          find "$OUTPUT_DIR" -type f \( -name "*.img" -o -name "*.bin" -o -name "*.elf" -o -name "*scatter*" \) -exec cp {} x659b_dump/ \; 2>/dev/null || true
+          # Copy extracted partitions
+          cp -r ${{ env.WORK_DIR }}/extracted_rom/super_extracted/*.img final_dump/X659B_firmware_dump/ 2>/dev/null || true
           
-          # Also check firmware directory if extraction happened there
-          find firmware -type f \( -name "*.img" -o -name "*.bin" \) -exec cp {} x659b_dump/ \; 2>/dev/null || true
-          
-          # Create README
-          cat > x659b_dump/README.md << 'EOF'
-          # Infinix Hot 10i X659B Firmware Dump
-          
-          **Device:** Infinix Hot 10i  
-          **Model:** X659B  
-          **Chipset:** MediaTek MT6768 (Helio P65)  
-          **Android Version:** 11 (Go Edition)  
-          
-          ## Contents
-          This firmware dump contains the following partitions:
-          - boot.img - Kernel image
-          - super.img - System partitions (system, vendor, product)
-          - preloader.bin - Bootloader
-          - vbmeta.img - Verified boot metadata
-          - dtbo.img - Device tree blob
-          - And other essential partitions
-          
-          ## Extraction Method
-          Extracted using Phoenix Firmware Dumper (Direct Tool Mode)
-          Source: ${{ env.FIRMWARE_URL }}
-          
-          ## Warning
-          These files are for educational and backup purposes only.
-          Flashing incorrect firmware may brick your device.
-          EOF
-          
-          # Create info file with metadata
-          cat > x659b_dump/info.txt << EOF
-          Device: Infinix Hot 10i X659B
-          Chipset: MediaTek MT6768 (Helio P65)
-          Source: ${{ env.FIRMWARE_URL }}
-          Type: ${{ env.FIRMWARE_TYPE }}
-          Extraction Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          GitHub Run: ${{ github.run_id }}
-          Workflow: ${{ github.workflow }}
-          EOF
-          
-          echo "=== Organized contents ==="
-          ls -lh x659b_dump/
-
-      - name: Create archives
-        run: |
-          echo "=== Creating compressed archives ==="
-          
-          if [ -d "x659b_dump" ] && [ "$(ls -A x659b_dump/)" ]; then
-            # Create zip archive
-            zip -r infinix_x659b_firmware_dump.zip x659b_dump/ -x "*.git*" -x "*/.git/*"
-            
-            # Create tar.gz archive
-            tar -czf infinix_x659b_firmware_dump.tar.gz x659b_dump/
-            
-            # Create tar.xz archive (better compression)
-            tar -cJf infinix_x659b_firmware_dump.tar.xz x659b_dump/
-            
-            # Generate checksums
-            sha256sum infinix_x659b_firmware_dump.zip infinix_x659b_firmware_dump.tar.gz infinix_x659b_firmware_dump.tar.xz > checksums.txt 2>/dev/null || true
-            md5sum infinix_x659b_firmware_dump.zip infinix_x659b_firmware_dump.tar.gz infinix_x659b_firmware_dump.tar.xz >> checksums.txt 2>/dev/null || true
-            
-            echo "=== Archives created ==="
-            ls -lh *.zip *.tar.* *.txt 2>/dev/null || echo "Some archives may be missing"
-          else
-            echo "Warning: No files to archive"
-            touch no_files_extracted.txt
+          # Copy system files if extracted
+          if [ -d "${{ env.WORK_DIR }}/extracted_rom/super_extracted/system_files" ]; then
+            tar -czf final_dump/X659B_firmware_dump/system_files.tar.gz -C ${{ env.WORK_DIR }}/extracted_rom/super_extracted system_files/
           fi
+          
+          # Copy vendor files
+          if [ -d "${{ env.WORK_DIR }}/extracted_rom/super_extracted/vendor_files" ]; then
+            tar -czf final_dump/X659B_firmware_dump/vendor_files.tar.gz -C ${{ env.WORK_DIR }}/extracted_rom/super_extracted vendor_files/
+          fi
+          
+          # Copy report and logs
+          cp ${{ env.DUMP_DIR }}/X659B_DUMP_REPORT.md final_dump/
+          cp ${{ github.workspace }}/phoenix_dump.log final_dump/ 2>/dev/null || true
+          
+          # Create final archive
+          tar -czf X659B_Full_Dump_${{ github.run_number }}.tar.gz -C final_dump .
+          
+          ls -lh X659B_Full_Dump_${{ github.run_number }}.tar.gz
 
-      - name: Upload artifacts
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: x659b-firmware-dump
+          name: X659B-Firmware-Dump-${{ github.run_number }}
           path: |
-            x659b_dump/
-            *.zip
-            *.tar.*
-            *.txt
-            extraction.log
-          retention-days: 5
-          compression-level: 0
+            final_dump/
+            ${{ env.WORK_DIR }}/extracted_rom/super_extracted/*.img
+            ${{ github.workspace }}/phoenix_dump.log
+          retention-days: 7
           if-no-files-found: warn
 
       - name: Create GitHub Release
-        if: github.event_name == 'workflow_dispatch' && success()
+        if: github.event.inputs.upload_to_github == 'true' && success()
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: x659b-dump-${{ github.run_number }}-${{ github.run_attempt }}
-          name: Infinix Hot 10i X659B Firmware Dump #${{ github.run_number }}
+          tag_name: x659b-dump-${{ github.run_number }}
+          name: Infinix Hot 10i (X659B) Firmware Dump #${{ github.run_number }}
           body: |
-            ## Infinix Hot 10i X659B Firmware Extraction
+            ## Infinix Hot 10i (X659B) Firmware Dump
             
-            **Source:** ${{ env.FIRMWARE_URL }}
-            **File Type:** ${{ env.FIRMWARE_TYPE }}
-            **Extraction Date:** ${{ github.event.repository.updated_at }}
+            **Device:** Infinix Hot 10i (X659B-OP)  
+            **Chipset:** MediaTek MT6768 (Helio P65)  
+            **Android:** 11 (API 30)  
+            **Firmware:** R2-Infinix-Hot-10i-X659B-14
             
-            ### Device Information
-            - **Model:** Infinix Hot 10i (X659B)
-            - **Chipset:** MediaTek MT6768 (Helio P65)
-            - **Android:** 11 (Go Edition)
+            ### Contents:
+            - Extracted dynamic partitions from super.img
+            - system.img, vendor.img, product.img, system_ext.img, odm.img
+            - Deep extracted system files (if mountable)
+            - Boot image analysis
+            - Full partition table
             
-            ### Archives Available
-            - `infinix_x659b_firmware_dump.zip` - Standard zip archive
-            - `infinix_x659b_firmware_dump.tar.gz` - Gzip compressed tar
-            - `infinix_x659b_firmware_dump.tar.xz` - XZ compressed tar (smallest)
-            - Individual partition files in `x659b_dump/`
-            
-            ### Checksums
-            See `checksums.txt` for SHA256 and MD5 hashes.
-            
-            ⚠️ **Warning:** Use at your own risk. Verify compatibility before flashing.
+            ### Notes:
+            This device uses Android Dynamic Partitions. The system, vendor, and product 
+            partitions are contained within super.img and have been extracted using lpunpack.
           files: |
-            infinix_x659b_firmware_dump.zip
-            infinix_x659b_firmware_dump.tar.gz
-            infinix_x659b_firmware_dump.tar.xz
-            checksums.txt
-          draft: false
-          prerelease: false
+            X659B_Full_Dump_${{ github.run_number }}.tar.gz
+            final_dump/X659B_DUMP_REPORT.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Debug Info
-        if: failure()
-        run: |
-          echo "=== Debug: Listing all directories ==="
-          ls -la
-          echo "=== Debug: Phoenix dumper contents ==="
-          ls -la phoenix_firmware_dumper/ || echo "Directory not found"
-          echo "=== Debug: Firmware directory ==="
-          ls -la firmware/ || echo "Directory not found"
-          echo "=== Debug: Extraction log ==="
-          cat phoenix_firmware_dumper/extraction.log 2>/dev/null || echo "No log file"
-          df -h
 
       - name: Cleanup
         if: always()
         run: |
-          echo "=== Cleaning up ==="
-          rm -rf firmware phoenix_firmware_dumper x659b_dump
-          df -h
+          echo "🧹 Cleaning up..."
+          sudo umount ${{ env.WORK_DIR }}/extracted_rom/super_extracted/system_mount 2>/dev/null || true
+          sudo umount ${{ env.WORK_DIR }}/extracted_rom/super_extracted/vendor_mount 2>/dev/null || true
+          rm -rf ${{ env.WORK_DIR }} || true
+          echo "✅ Cleanup complete"
+          
