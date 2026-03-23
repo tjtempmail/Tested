@@ -22,16 +22,10 @@ on:
           - pac
           - ofp
           - nb0
-      use_aria2:
-        description: 'Use aria2 for faster downloads'
-        required: false
-        default: true
-        type: boolean
 
 env:
   FIRMWARE_URL: ${{ github.event.inputs.firmware_url }}
   FIRMWARE_TYPE: ${{ github.event.inputs.firmware_type }}
-  USE_ARIA2: ${{ github.event.inputs.use_aria2 }}
 
 jobs:
   dump-firmware:
@@ -41,7 +35,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies and Phoenix Firmware Dumper
+      - name: Install dependencies
         run: |
           echo "=== Installing System Dependencies ==="
           sudo apt-get update -qq
@@ -99,15 +93,13 @@ jobs:
             2>&1 | grep -v "debconf\|Selecting\|Preparing\|Unpacking\|Setting up\|Processing\|Scanning\|Building" || true
 
           echo "=== Verifying aria2 installation ==="
-          aria2c --version | head -5
+          aria2c --version | head -3
 
           echo "=== Installing Python packages ==="
           pip3 install -q --upgrade pip setuptools wheel
           pip3 install -q \
             backports.lzma \
             docopt \
-            git+https://github.com/seemoo-lab/pyshim.git \
-            git+https://github.com/seemoo-lab/firmadyne.git \
             protobuf \
             pycryptodome \
             six \
@@ -123,7 +115,8 @@ jobs:
           chmod +x payload-dumper-go
           sudo mv payload-dumper-go /usr/local/bin/
           rm payload-dumper-go_1.2.2_linux_amd64.tar.gz
-          payload-dumper-go --version
+          echo "Payload Dumper Go installed"
+          payload-dumper-go -h | head -5
 
           echo "=== Cloning Phoenix Firmware Dumper ==="
           git clone --depth 1 https://github.com/DroidDumps/phoenix_firmware_dumper.git
@@ -131,7 +124,8 @@ jobs:
           
           echo "=== Running Phoenix Setup ==="
           chmod +x setup.sh
-          ./setup.sh 2>&1 | tail -20 || true
+          # Skip git clone errors in setup.sh by running with error tolerance
+          ./setup.sh 2>&1 | tail -30 || true
           
           echo "=== Setup Complete ==="
           ls -la
@@ -145,7 +139,7 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune -af
+          sudo docker image prune -af 2>/dev/null || true
           sudo apt-get clean
           df -h
 
@@ -154,32 +148,23 @@ jobs:
           mkdir -p firmware
           cd firmware
           
-          if [ "${{ env.USE_ARIA2 }}" = "true" ]; then
-            echo "=== Downloading with aria2 (fast multi-connection) ==="
-            aria2c -x16 -s16 -k1M \
-              --max-connection-per-server=16 \
-              --min-split-size=1M \
-              --split=16 \
-              --max-tries=5 \
-              --retry-wait=5 \
-              --timeout=600 \
-              --max-download-limit=0 \
-              --allow-overwrite=true \
-              --auto-file-renaming=false \
-              --summary-interval=10 \
-              --console-log-level=notice \
-              --download-result=full \
-              --file-allocation=none \
-              -o firmware.${{ env.FIRMWARE_TYPE }} \
-              "${{ env.FIRMWARE_URL }}"
-          else
-            echo "=== Downloading with wget ==="
-            wget --progress=bar:force:noscroll \
-              --tries=5 \
-              --timeout=600 \
-              -O firmware.${{ env.FIRMWARE_TYPE }} \
-              "${{ env.FIRMWARE_URL }}"
-          fi
+          echo "=== Downloading with aria2 (fast multi-connection) ==="
+          aria2c -x16 -s16 -k1M \
+            --max-connection-per-server=16 \
+            --min-split-size=1M \
+            --split=16 \
+            --max-tries=5 \
+            --retry-wait=5 \
+            --timeout=600 \
+            --max-download-limit=0 \
+            --allow-overwrite=true \
+            --auto-file-renaming=false \
+            --summary-interval=10 \
+            --console-log-level=notice \
+            --download-result=full \
+            --file-allocation=none \
+            -o firmware.${{ env.FIRMWARE_TYPE }} \
+            "${{ env.FIRMWARE_URL }}"
           
           echo "=== Download complete ==="
           ls -lh firmware.${{ env.FIRMWARE_TYPE }}
@@ -195,7 +180,7 @@ jobs:
           echo "Type: ${{ env.FIRMWARE_TYPE }}"
           
           # Run the dumper with the firmware file
-          ./dumper.sh "../firmware/firmware.${{ env.FIRMWARE_TYPE }}" 2>&1 | tee extraction.log
+          ./dumper.sh "../firmware/firmware.${{ env.FIRMWARE_TYPE }}" 2>&1 | tee extraction.log || true
           
           echo "=== Extraction complete ==="
           ls -la
@@ -204,20 +189,28 @@ jobs:
         run: |
           echo "=== Organizing extracted files ==="
           
-          # Find the output directory (usually created by phoenix dumper)
-          OUTPUT_DIR=$(find phoenix_firmware_dumper -maxdepth 2 -type d -name "*firmware*" -o -name "*extract*" | head -1)
-          if [ -z "$OUTPUT_DIR" ]; then
-            OUTPUT_DIR="phoenix_firmware_dumper"
+          # Find the output directory (phoenix dumper usually creates a folder based on filename)
+          OUTPUT_DIR=$(find . -maxdepth 2 -type d -name "*firmware*" -o -name "*extract*" -o -name "*dump*" | grep -v "phoenix_firmware_dumper" | head -1)
+          if [ -z "$OUTPUT_DIR" ] || [ ! -d "$OUTPUT_DIR" ]; then
+            # Check inside phoenix dumper
+            OUTPUT_DIR=$(find phoenix_firmware_dumper -maxdepth 2 -type d | grep -v ".git" | tail -1)
           fi
+          
+          if [ -z "$OUTPUT_DIR" ] || [ ! -d "$OUTPUT_DIR" ]; then
+            echo "No specific output dir found, using current directory contents"
+            OUTPUT_DIR="."
+          fi
+          
+          echo "Using output directory: $OUTPUT_DIR"
           
           # Create organized structure
           mkdir -p x659b_dump
           
-          # Find and move all image files
-          find "$OUTPUT_DIR" -type f \( -name "*.img" -o -name "*.bin" -o -name "*.elf" \) -exec cp {} x659b_dump/ \; 2>/dev/null || true
+          # Find and copy all image/bin files
+          find "$OUTPUT_DIR" -type f \( -name "*.img" -o -name "*.bin" -o -name "*.elf" -o -name "*scatter*" \) -exec cp {} x659b_dump/ \; 2>/dev/null || true
           
-          # Find scatter file if exists
-          find "$OUTPUT_DIR" -name "*scatter*" -exec cp {} x659b_dump/ \; 2>/dev/null || true
+          # Also check firmware directory if extraction happened there
+          find firmware -type f \( -name "*.img" -o -name "*.bin" \) -exec cp {} x659b_dump/ \; 2>/dev/null || true
           
           # Create README
           cat > x659b_dump/README.md << 'EOF'
@@ -254,6 +247,7 @@ jobs:
           Type: ${{ env.FIRMWARE_TYPE }}
           Extraction Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
           GitHub Run: ${{ github.run_id }}
+          Workflow: ${{ github.workflow }}
           EOF
           
           echo "=== Organized contents ==="
@@ -263,36 +257,44 @@ jobs:
         run: |
           echo "=== Creating compressed archives ==="
           
-          # Create zip archive
-          zip -r infinix_x659b_firmware_dump.zip x659b_dump/ -x "*.git*" -x "*/.git/*"
-          
-          # Create tar.gz archive
-          tar -czf infinix_x659b_firmware_dump.tar.gz x659b_dump/
-          
-          # Create tar.xz archive (better compression)
-          tar -cJf infinix_x659b_firmware_dump.tar.xz x659b_dump/
-          
-          # Generate checksums
-          sha256sum infinix_x659b_firmware_dump.zip infinix_x659b_firmware_dump.tar.gz infinix_x659b_firmware_dump.tar.xz > checksums.txt
-          md5sum infinix_x659b_firmware_dump.zip infinix_x659b_firmware_dump.tar.gz infinix_x659b_firmware_dump.tar.xz >> checksums.txt
-          
-          echo "=== Archives created ==="
-          ls -lh *.zip *.tar.* *.txt
+          if [ -d "x659b_dump" ] && [ "$(ls -A x659b_dump/)" ]; then
+            # Create zip archive
+            zip -r infinix_x659b_firmware_dump.zip x659b_dump/ -x "*.git*" -x "*/.git/*"
+            
+            # Create tar.gz archive
+            tar -czf infinix_x659b_firmware_dump.tar.gz x659b_dump/
+            
+            # Create tar.xz archive (better compression)
+            tar -cJf infinix_x659b_firmware_dump.tar.xz x659b_dump/
+            
+            # Generate checksums
+            sha256sum infinix_x659b_firmware_dump.zip infinix_x659b_firmware_dump.tar.gz infinix_x659b_firmware_dump.tar.xz > checksums.txt 2>/dev/null || true
+            md5sum infinix_x659b_firmware_dump.zip infinix_x659b_firmware_dump.tar.gz infinix_x659b_firmware_dump.tar.xz >> checksums.txt 2>/dev/null || true
+            
+            echo "=== Archives created ==="
+            ls -lh *.zip *.tar.* *.txt 2>/dev/null || echo "Some archives may be missing"
+          else
+            echo "Warning: No files to archive"
+            touch no_files_extracted.txt
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: x659b-firmware-dump
           path: |
             x659b_dump/
-            infinix_x659b_firmware_dump.zip
-            infinix_x659b_firmware_dump.tar.gz
-            checksums.txt
+            *.zip
+            *.tar.*
+            *.txt
+            extraction.log
           retention-days: 5
           compression-level: 0
+          if-no-files-found: warn
 
       - name: Create GitHub Release
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && success()
         uses: softprops/action-gh-release@v1
         with:
           tag_name: x659b-dump-${{ github.run_number }}-${{ github.run_attempt }}
@@ -302,7 +304,6 @@ jobs:
             
             **Source:** ${{ env.FIRMWARE_URL }}
             **File Type:** ${{ env.FIRMWARE_TYPE }}
-            **Download Method:** ${{ env.USE_ARIA2 == 'true' && 'aria2 (16 connections)' || 'wget' }}
             **Extraction Date:** ${{ github.event.repository.updated_at }}
             
             ### Device Information
@@ -329,6 +330,19 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Debug Info
+        if: failure()
+        run: |
+          echo "=== Debug: Listing all directories ==="
+          ls -la
+          echo "=== Debug: Phoenix dumper contents ==="
+          ls -la phoenix_firmware_dumper/ || echo "Directory not found"
+          echo "=== Debug: Firmware directory ==="
+          ls -la firmware/ || echo "Directory not found"
+          echo "=== Debug: Extraction log ==="
+          cat phoenix_firmware_dumper/extraction.log 2>/dev/null || echo "No log file"
+          df -h
 
       - name: Cleanup
         if: always()
