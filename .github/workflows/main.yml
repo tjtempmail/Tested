@@ -1,4 +1,4 @@
-name: X659B Firmware Extractor - ERROR-FIXED
+name: X659B Firmware Extractor - 7ZIP METHOD
 
 on:
   workflow_dispatch:
@@ -18,461 +18,267 @@ env:
 jobs:
   firmware-process:
     runs-on: ubuntu-22.04
-    timeout-minutes: 240  # Extended for large firmware
+    timeout-minutes: 240
     
     steps:
-      # ERROR FIX #1: Use alternative space freeing method if maximize-build-space fails
-      - name: Free Up Disk Space (Ubuntu)
+      - name: Free Up Disk Space
         run: |
           echo "🧹 Freeing up disk space..."
-          # Remove unnecessary large packages
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          
-          # Clean apt cache
-          sudo apt-get clean
-          sudo apt-get autoremove -y
-          
-          # Show available space
-          echo "Available space after cleanup:"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean && sudo apt-get autoremove -y
           df -h
-
-      # ERROR FIX #2: Alternative space maximization with fallback
-      - name: Maximize Build Space (with fallback)
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 2048
-          swap-size-mb: 4096
-          remove-dotnet: 'true'
-          remove-haskell: 'true'
-          remove-android: 'true'
-          remove-codeql: 'true'
-          overprovision-lvm: 'true'
-        continue-on-error: true  # Continue even if this fails
 
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # ERROR FIX #3: Install ALL dependencies including build tools
-      - name: Install Dependencies & Build Tools
+      - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            aria2 \
-            p7zip-full \
-            p7zip-rar \
-            unzip \
-            unrar \
-            liblz4-tool \
-            brotli \
-            simg2img \
-            img2simg \
-            e2fsprogs \
-            qemu-utils \
-            kpartx \
-            sleuthkit \
-            binwalk \
-            python3 \
-            python3-pip \
-            git \
-            curl \
-            wget \
-            file \
-            tree \
-            pv \
-            bc \
-            jq \
-            cpio \
-            xz-utils \
-            build-essential \
-            cmake \
-            libssl-dev \
-            libz-dev \
-            liblzma-dev \
-            libbz2-dev \
-            g++ \
-            gcc \
-            make \
-            autoconf \
-            automake \
-            libtool \
-            pkg-config \
-            android-sdk-libsparse-utils \
-            libext2fs2 \
-            e2fsprogs \
-            e2fsck-static
-
-          # Install Python tools
-          pip3 install --user protobuf bsdiff4 pycryptodome
-
-      # ERROR FIX #4: Download and build lpunpack from source (ensures compatibility)
-      - name: Build lpunpack from Source
-        run: |
-          echo "🔨 Building lpunpack from source..."
-          mkdir -p ${{ github.workspace }}/tools
-          cd ${{ github.workspace }}/tools
-          
-          # Clone and build lpunpack
-          git clone --depth 1 https://github.com/LonelyFool/lpunpack_and_lpmake.git
-          cd lpunpack_and_lpmake
-          
-          # Install dependencies
-          sudo apt-get install -y libext2fs-dev
-          
-          # Build
-          mkdir -p build && cd build
-          cmake ..
-          make -j$(nproc)
-          
-          # Copy binary to tools directory
-          cp lpunpack ${{ github.workspace }}/tools/lpunpack
-          chmod +x ${{ github.workspace }}/tools/lpunpack
-          
-          echo "✅ lpunpack built successfully"
-          ${{ github.workspace }}/tools/lpunpack --help || true
-
-      # ERROR FIX #5: Download imjtool with fallback mirrors
-      - name: Download imjtool (with fallback)
-        run: |
-          echo "📥 Downloading imjtool..."
-          mkdir -p ${{ github.workspace }}/tools
-          cd ${{ github.workspace }}/tools
-          
-          # Try multiple sources
-          wget -q --timeout=30 http://newandroidbook.com/tools/imjtool.tgz -O imjtool.tgz || \
-          wget -q --timeout=30 https://github.com/4n0n1m4t3/imjtool/releases/download/v2.0/imjtool.tgz -O imjtool.tgz || \
-          curl -L --max-time 30 -o imjtool.tgz http://newandroidbook.com/tools/imjtool.tgz
-          
-          if [ -f "imjtool.tgz" ] && [ -s "imjtool.tgz" ]; then
-            tar -xzf imjtool.tgz
-            chmod +x imjtool* || true
-            echo "✅ imjtool downloaded"
-          else
-            echo "⚠️ imjtool download failed, will use alternative methods"
-          fi
+            aria2 p7zip-full p7zip-rar unzip unrar \
+            simg2img e2fsprogs file tree pv curl wget \
+            python3 python3-pip git cpio xz-utils \
+            liblz4-tool brotli binwalk
+            
+          pip3 install --user protobuf pycryptodome
 
       - name: Create Working Directories
         run: |
-          mkdir -p ${{ env.WORK_DIR }}
-          mkdir -p ${{ env.DUMP_DIR }}
           mkdir -p ${{ env.WORK_DIR }}/extracted_rom
           mkdir -p ${{ env.WORK_DIR }}/super_extracted
+          mkdir -p ${{ env.WORK_DIR }}/system_files
+          mkdir -p ${{ env.DUMP_DIR }}
 
-      # ERROR FIX #6: Robust aria2 download with retry logic and timeout handling
-      - name: Download Firmware (Robust)
+      # ERROR FIX: Robust download with Archive.org optimizations
+      - name: Download Firmware
         working-directory: ${{ env.WORK_DIR }}
         run: |
-          echo "🚀 Starting robust firmware download..."
+          echo "🚀 Downloading firmware..."
           
-          # Create robust aria2 config
           cat > aria2.conf << 'EOF'
-          # Connection settings optimized for Archive.org
-          max-connection-per-server=8
+          max-connection-per-server=4
           min-split-size=50M
-          split=8
+          split=4
           max-concurrent-downloads=2
-          
-          # Retry and timeout settings (CRITICAL for Archive.org)
           connect-timeout=120
           timeout=600
-          retry-wait=10
+          retry-wait=15
           max-tries=10
           continue=true
-          remote-time=true
-          
-          # Performance
-          file-allocation=trunc
-          disk-cache=256M
-          enable-http-pipelining=false
-          enable-http-keep-alive=true
-          http-accept-gzip=true
-          
-          # Speed limit to avoid throttling (Archive.org friendly)
-          max-download-limit=10M
-          
-          # Logging
-          log-level=notice
-          summary-interval=30
-          console-log-level=warn
-          
-          # User agent
-          user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+          max-download-limit=5M
+          user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36
           EOF
           
-          # Download with retry logic
           for attempt in 1 2 3; do
-            echo "Download attempt $attempt..."
-            if aria2c --conf-path=aria2.conf \
+            echo "Attempt $attempt..."
+            aria2c --conf-path=aria2.conf \
               --dir=${{ env.WORK_DIR }} \
               --out=${{ env.FIRMWARE_FILENAME }} \
-              "${{ env.FIRMWARE_URL }}"; then
-              echo "✅ Download successful on attempt $attempt"
-              break
-            else
-              echo "⚠️ Attempt $attempt failed, retrying..."
-              sleep 30
-            fi
+              "${{ env.FIRMWARE_URL }}" && break
+            sleep 30
           done
           
-          # Verify download
-          if [ ! -f "${{ env.FIRMWARE_FILENAME }}" ]; then
-            echo "❌ Download failed after all attempts"
-            exit 1
-          fi
-          
-          # Check file size (should be > 1GB)
-          FILE_SIZE=$(stat -c%s "${{ env.FIRMWARE_FILENAME }}" 2>/dev/null || stat -f%z "${{ env.FIRMWARE_FILENAME }}" 2>/dev/null)
-          if [ "$FILE_SIZE" -lt 1073741824 ]; then
-            echo "❌ File too small ($FILE_SIZE bytes), likely incomplete"
-            exit 1
-          fi
-          
-          echo "✅ Download verified: $(ls -lh ${{ env.FIRMWARE_FILENAME }} | awk '{print $5}')"
-          file ${{ env.FIRMWARE_FILENAME }}
+          ls -lh ${{ env.FIRMWARE_FILENAME }}
 
-      # ERROR FIX #7: Multi-method extraction with fallback
-      - name: Extract Firmware Archive (Multi-method)
+      # ERROR FIX: Multi-method extraction
+      - name: Extract Firmware Archive
         working-directory: ${{ env.WORK_DIR }}
         run: |
-          echo "📦 Extracting firmware archive..."
+          echo "📦 Extracting archive..."
           
-          # Try 7z first (best for large archives)
-          if 7z x ${{ env.FIRMWARE_FILENAME }} -oextracted_rom -y -bb0 2>/dev/null; then
-            echo "✅ Extraction with 7z successful"
-          # Fallback to unzip
-          elif unzip -q ${{ env.FIRMWARE_FILENAME }} -d extracted_rom 2>/dev/null; then
-            echo "✅ Extraction with unzip successful"
-          # Fallback to unrar
-          elif unrar x -y ${{ env.FIRMWARE_FILENAME }} extracted_rom/ 2>/dev/null; then
-            echo "✅ Extraction with unrar successful"
+          # Try 7z first
+          if 7z x ${{ env.FIRMWARE_FILENAME }} -oextracted_rom -y -bb0; then
+            echo "✅ 7z extraction successful"
+          elif unzip -q ${{ env.FIRMWARE_FILENAME }} -d extracted_rom; then
+            echo "✅ unzip successful"
           else
-            echo "❌ All extraction methods failed"
+            echo "❌ Extraction failed"
             exit 1
           fi
           
-          echo "📁 Firmware contents:"
-          find extracted_rom/ -type f -name "*.img" -o -name "*.bin" | head -20
-          
-          # Check for super.img
-          if [ ! -f "extracted_rom/super.img" ]; then
-            echo "⚠️ super.img not found in root, searching..."
-            find extracted_rom/ -name "super.img" -type f
-          fi
+          # Find super.img
+          find extracted_rom/ -name "super.img" -type f
 
-      # ERROR FIX #8: Handle super.img with multiple methods and error recovery
-      - name: Process Super.img (Dynamic Partitions)
+      # MAIN METHOD: Use 7zip to extract super.img contents
+      - name: Extract Super.img Using 7ZIP
         working-directory: ${{ env.WORK_DIR }}/extracted_rom
         run: |
-          echo "🔧 Processing super.img..."
+          echo "🔧 Extracting super.img with 7ZIP..."
           
           SUPER_IMG=$(find . -name "super.img" -type f | head -1)
-          
           if [ -z "$SUPER_IMG" ]; then
-            echo "❌ super.img not found anywhere in extracted_rom"
+            echo "❌ super.img not found"
             exit 1
           fi
           
-          echo "Found: $SUPER_IMG"
-          ls -lh "$SUPER_IMG"
+          echo "Found: $SUPER_IMG ($(ls -lh $SUPER_IMG | awk '{print $5}'))"
           file "$SUPER_IMG"
           
-          # Check if it's already a sparse image or raw
+          # Check magic to see if sparse
           MAGIC=$(xxd -l 4 "$SUPER_IMG" | awk '{print $2}')
-          echo "Header magic: $MAGIC"
+          echo "Magic bytes: $MAGIC"
           
-          # ERROR FIX #9: Handle both sparse and raw super.img
-          if echo "$MAGIC" | grep -q "3aff"; then
-            echo "✅ super.img is already in raw format"
-            cp "$SUPER_IMG" super_raw.img
-          else
-            echo "🔄 Converting sparse super.img to raw..."
-            if simg2img "$SUPER_IMG" super_raw.img 2>/dev/null; then
-              echo "✅ Conversion successful"
-            else
-              echo "⚠️ simg2img failed, trying alternative..."
-              # Try img2simg reverse or just use as-is
+          # Convert sparse to raw if needed
+          if echo "$MAGIC" | grep -qv "3aff"; then
+            echo "🔄 Converting sparse to raw..."
+            simg2img "$SUPER_IMG" super_raw.img || {
+              echo "⚠️ simg2img failed, copying as-is"
               cp "$SUPER_IMG" super_raw.img
-            fi
+            }
+          else
+            cp "$SUPER_IMG" super_raw.img
           fi
           
           ls -lh super_raw.img
-
-      # ERROR FIX #10: Extract partitions with multiple fallback methods
-      - name: Extract Partitions from Super
-        working-directory: ${{ env.WORK_DIR }}/extracted_rom
-        run: |
-          echo "🔍 Extracting logical partitions..."
           
-          # Method 1: Use built lpunpack
-          if [ -f "${{ github.workspace }}/tools/lpunpack" ]; then
-            echo "Trying custom lpunpack..."
-            ${{ github.workspace }}/tools/lpunpack super_raw.img super_extracted/ 2>/dev/null && echo "✅ lpunpack success" || echo "⚠️ lpunpack failed"
-          fi
-          
-          # Method 2: Try imjtool if available
-          if [ -f "${{ github.workspace }}/tools/imjtool.ELF64" ]; then
-            echo "Trying imjtool..."
-            mkdir -p imjtool_out
-            cd imjtool_out
-            ${{ github.workspace }}/tools/imjtool.ELF64 ../super_raw.img extract 2>/dev/null && echo "✅ imjtool success" || echo "⚠️ imjtool failed"
-            cd ..
-            # Move extracted files
-            mv imjtool_out/*.img super_extracted/ 2>/dev/null || true
-          fi
-          
-          # Method 3: Try system lpunpack if available
-          if command -v lpunpack &> /dev/null; then
-            echo "Trying system lpunpack..."
-            lpunpack super_raw.img super_extracted/ 2>/dev/null && echo "✅ system lpunpack success" || echo "⚠️ system lpunpack failed"
-          fi
+          # METHOD 1: Try 7z direct extraction on raw super.img
+          echo "📦 Method 1: 7z direct extraction..."
+          mkdir -p super_7z_extracted
+          7z x super_raw.img -osuper_7z_extracted -y || echo "⚠️ 7z direct extraction had issues"
           
           # Check what we got
-          echo "📊 Extracted partitions:"
-          ls -lh super_extracted/ || echo "⚠️ No partitions extracted yet"
+          echo "7z extraction results:"
+          find super_7z_extracted/ -type f -name "*.img" 2>/dev/null | head -20
           
-          # If still empty, try direct extraction with dd (last resort)
-          if [ ! "$(ls -A super_extracted/ 2>/dev/null)" ]; then
-            echo "⚠️ All methods failed, attempting manual extraction info..."
-            ${{ github.workspace }}/tools/imjtool.ELF64 super_raw.img info 2>/dev/null || file super_raw.img
-          fi
-
-      # ERROR FIX #11: Handle partition images with proper sparse detection
-      - name: Process Extracted Partitions
-        working-directory: ${{ env.WORK_DIR }}/extracted_rom/super_extracted
-        run: |
-          echo "🔧 Processing extracted partitions..."
-          
-          for img in *.img; do
-            if [ -f "$img" ]; then
-              echo "Processing: $img ($(stat -c%s "$img" 2>/dev/null || stat -f%z "$img" 2>/dev/null) bytes)"
-              
-              # Check if sparse
-              MAGIC=$(xxd -l 4 "$img" | awk '{print $2}' 2>/dev/null || echo "unknown")
-              
-              if echo "$MAGIC" | grep -q "3aff"; then
-                echo "  -> Sparse image detected, converting..."
-                simg2img "$img" "${img%.img}_raw.img" 2>/dev/null || cp "$img" "${img%.img}_raw.img"
-              else
-                echo "  -> Already raw or unknown format"
-                cp "$img" "${img%.img}_raw.img" 2>/dev/null || true
+          # If 7z found internal images, extract them
+          if [ -d "super_7z_extracted" ]; then
+            # Look for nested images (0.img, 1.img, etc. which are partitions)
+            for img in super_7z_extracted/*.img super_7z_extracted/*/*.img; do
+              if [ -f "$img" ]; then
+                name=$(basename "$img" .img)
+                echo "Processing nested image: $name"
+                mkdir -p "super_extracted/${name}_files"
+                
+                # Try to extract this partition image with 7z
+                7z x "$img" -o"super_extracted/${name}_files" -y || {
+                  # If 7z fails, might be raw ext4, try mount
+                  echo "  7z failed, attempting mount..."
+                  mkdir -p "super_extracted/${name}_mount"
+                  sudo mount -o loop,ro "$img" "super_extracted/${name}_mount" 2>/dev/null && {
+                    sudo cp -a "super_extracted/${name}_mount"/* "super_extracted/${name}_files"/
+                    sudo umount "super_extracted/${name}_mount"
+                  } || echo "  Mount also failed for $name"
+                }
               fi
-            fi
-          done
+            done
+          fi
           
-          echo "✅ Partition processing complete"
-          ls -lh *_raw.img 2>/dev/null || ls -lh
+          # METHOD 2: If 7z didn't work well, try binwalk extraction
+          if [ ! "$(ls -A super_extracted/ 2>/dev/null)" ]; then
+            echo "📦 Method 2: Binwalk extraction..."
+            binwalk -e super_raw.img -C super_binwalk/ || true
+            
+            # Move extracted files
+            find super_binwalk/ -name "*.img" -exec cp {} super_extracted/ \; 2>/dev/null || true
+          fi
+          
+          echo "✅ Final extraction results:"
+          ls -lhR super_extracted/ | head -50
 
-      # ERROR FIX #12: Mount with offset detection and fallback
-      - name: Deep Extract System Files
-        working-directory: ${{ env.WORK_DIR }}/extracted_rom/super_extracted
+      # ERROR FIX: Deep extract system partition with 7z fallback
+      - name: Deep Extract System Partition
+        working-directory: ${{ env.WORK_DIR }}/extracted_rom
         run: |
-          echo "🔍 Deep extracting system files..."
+          echo "🔍 Deep extracting system partition..."
           
-          # Find system image
-          SYSTEM_IMG=$(find . -name "system*_raw.img" -o -name "system*.img" | grep -v sparse | head -1)
+          # Find system image (various naming conventions)
+          SYSTEM_IMG=$(find super_extracted/ super_7z_extracted/ -name "*system*.img" -o -name "0.img" -o -name "1.img" | head -1)
           
           if [ -z "$SYSTEM_IMG" ]; then
             echo "⚠️ No system image found for deep extraction"
-            exit 0  # Don't fail, just skip
+            exit 0
           fi
           
-          echo "Deep extracting: $SYSTEM_IMG"
+          echo "Found system image: $SYSTEM_IMG ($(ls -lh $SYSTEM_IMG | awk '{print $5}'))"
+          file "$SYSTEM_IMG"
           
-          # Try to mount with offset detection
-          mkdir -p system_mount system_files
+          # Create output directory
+          mkdir -p ${{ env.WORK_DIR }}/system_files
           
-          # Check if it's a full disk image with offset
-          if command -v parted &> /dev/null; then
-            echo "Checking partition layout..."
-            parted -s "$SYSTEM_IMG" unit B print 2>/dev/null || true
-          fi
+          # METHOD 1: Try 7z extraction (works for ext4 images) [^74^][^75^]
+          echo "Trying 7z extraction on system image..."
+          7z x "$SYSTEM_IMG" -o${{ env.WORK_DIR }}/system_files -y || {
+            echo "⚠️ 7z extraction failed, trying mount..."
+            
+            # METHOD 2: Mount as fallback
+            mkdir -p /tmp/system_mount
+            if sudo mount -o loop,ro "$SYSTEM_IMG" /tmp/system_mount 2>/dev/null; then
+              echo "✅ Mounted, copying files..."
+              sudo cp -a /tmp/system_mount/* ${{ env.WORK_DIR }}/system_files/
+              sudo umount /tmp/system_mount
+            else
+              echo "⚠️ Mount failed, trying simg2img + 7z..."
+              
+              # METHOD 3: Convert if sparse then try 7z again
+              simg2img "$SYSTEM_IMG" /tmp/system_raw.img 2>/dev/null && {
+                7z x /tmp/system_raw.img -o${{ env.WORK_DIR }}/system_files -y || \
+                sudo mount -o loop,ro /tmp/system_raw.img /tmp/system_mount && \
+                sudo cp -a /tmp/system_mount/* ${{ env.WORK_DIR }}/system_files/ && \
+                sudo umount /tmp/system_mount
+              }
+            fi
+          }
           
-          # Try binwalk to find offset
-          echo "Searching for filesystem offset..."
-          OFFSET=$(binwalk -t "$SYSTEM_IMG" 2>/dev/null | grep -i ext | head -1 | awk '{print $1}' || echo "")
+          # Count extracted files
+          FILE_COUNT=$(find ${{ env.WORK_DIR }}/system_files -type f 2>/dev/null | wc -l)
+          echo "✅ Extracted $FILE_COUNT files from system partition"
           
-          if [ -n "$OFFSET" ]; then
-            echo "Found offset: $OFFSET"
-            MOUNT_OPTS="loop,ro,offset=$OFFSET"
-          else
-            MOUNT_OPTS="loop,ro"
-          fi
-          
-          # Try mount with timeout
-          echo "Mounting with: $MOUNT_OPTS"
-          if timeout 30 sudo mount -t ext4 -o $MOUNT_OPTS "$SYSTEM_IMG" system_mount 2>/dev/null; then
-            echo "✅ Mounted successfully, copying files..."
-            sudo cp -a system_mount/* system_files/ 2>/dev/null || sudo cp -r system_mount/* system_files/
-            sudo umount system_mount 2>/dev/null || true
-            echo "✅ System files extracted: $(find system_files/ -type f 2>/dev/null | wc -l) files"
-          else
-            echo "⚠️ Mount failed, trying 7z extraction..."
-            7z x "$SYSTEM_IMG" -osystem_7z -y 2>/dev/null || true
-          fi
+          # List top-level directories
+          ls -la ${{ env.WORK_DIR }}/system_files/ | head -20
 
-      # ERROR FIX #13: Clone Phoenix Dumper with error handling
+      # ERROR FIX: Process other partitions
+      - name: Extract Vendor and Product Partitions
+        working-directory: ${{ env.WORK_DIR }}/extracted_rom
+        run: |
+          echo "🔧 Extracting vendor and product partitions..."
+          
+          for part in vendor product system_ext odm; do
+            IMG=$(find super_extracted/ super_7z_extracted/ -name "*${part}*.img" | head -1)
+            if [ -n "$IMG" ]; then
+              echo "Extracting $part from $IMG..."
+              mkdir -p ${{ env.WORK_DIR }}/${part}_files
+              
+              # Try 7z first
+              7z x "$IMG" -o${{ env.WORK_DIR }}/${part}_files -y || {
+                # Fallback to mount
+                mkdir -p /tmp/${part}_mnt
+                sudo mount -o loop,ro "$IMG" /tmp/${part}_mnt 2>/dev/null && {
+                  sudo cp -a /tmp/${part}_mnt/* ${{ env.WORK_DIR }}/${part}_files/
+                  sudo umount /tmp/${part}_mnt
+                } || echo "⚠️ Could not extract $part"
+              }
+            fi
+          done
+
       - name: Setup Phoenix Firmware Dumper
         run: |
-          echo "🐦 Setting up Phoenix Firmware Dumper..."
-          
-          # Clone with retry
-          for attempt in 1 2 3; do
-            if git clone --depth 1 https://github.com/DroidDumps/phoenix_firmware_dumper.git ${{ github.workspace }}/phoenix_dumper; then
-              break
-            fi
-            sleep 10
-          done
-          
+          echo "🐦 Setting up Phoenix Dumper..."
+          git clone --depth 1 https://github.com/DroidDumps/phoenix_firmware_dumper.git ${{ github.workspace }}/phoenix_dumper
           cd ${{ github.workspace }}/phoenix_dumper
-          
-          # Make scripts executable
           chmod +x *.sh
-          
-          # Run setup with error tolerance
-          ./setup.sh || echo "⚠️ Setup had warnings, continuing..."
-          
-          # Verify critical tools
-          ls -la tools/ || echo "⚠️ Tools directory check"
-          
-          echo "✅ Phoenix Dumper ready"
+          ./setup.sh || echo "⚠️ Setup warnings, continuing..."
 
-      # ERROR FIX #14: Run dumper with comprehensive error handling
       - name: Run Phoenix Firmware Dumper
         working-directory: ${{ github.workspace }}/phoenix_dumper
         run: |
-          echo "🚀 Running Phoenix Firmware Dumper..."
+          echo "🚀 Running Phoenix Dumper..."
           
-          # Setup credentials if requested
           if [ "${{ github.event.inputs.upload_to_github }}" = "true" ]; then
             echo "${{ secrets.GITHUB_TOKEN }}" > .github_token
             echo "${{ github.repository_owner }}" > .github_orgname
           fi
           
-          FIRMWARE_PATH="${{ env.WORK_DIR }}/extracted_rom"
-          
-          # Run with timeout and capture output
-          timeout 3600 ./dumper.sh "$FIRMWARE_PATH" 2>&1 | tee ${{ github.workspace }}/phoenix_dump.log || {
-            echo "⚠️ Dumper had issues, checking what we have..."
+          timeout 3600 ./dumper.sh "${{ env.WORK_DIR }}/extracted_rom" 2>&1 | tee ${{ github.workspace }}/phoenix_dump.log || {
+            echo "⚠️ Dumper had issues, using our 7z extraction instead"
           }
           
-          # Copy any outputs
-          if [ -d "output" ]; then
-            cp -r output/* ${{ env.DUMP_DIR }}/ 2>/dev/null || true
-          fi
-          
-          # Find and copy any dump directories
-          find . -type d -name "*dump*" -exec cp -r {} ${{ env.DUMP_DIR }}/ \; 2>/dev/null || true
+          cp -r output/* ${{ env.DUMP_DIR }}/ 2>/dev/null || true
 
-      # ERROR FIX #15: Generate comprehensive report with error handling
       - name: Generate Report
         working-directory: ${{ env.DUMP_DIR }}
         run: |
-          echo "📊 Generating report..."
-          
-          cat > X659B_DUMP_REPORT.md << 'EOF'
+          cat > X659B_DUMP_REPORT.md << EOF
           # Infinix Hot 10i (X659B) Firmware Dump Report
           
           ## Device Information
@@ -480,47 +286,61 @@ jobs:
           - **Model:** X659B-OP
           - **Codename:** X659B
           - **Chipset:** MediaTek MT6768 (Helio P65)
-          - **Architecture:** ARM64
           - **Android Version:** 11 (API 30)
-          - **Firmware:** R2-Infinix-Hot-10i-X659B-14
+          - **Extraction Method:** 7ZIP + Mount Fallback
           
           ## Extraction Summary
+          - **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          - **Firmware:** ${{ env.FIRMWARE_FILENAME }}
+          
+          ## Extracted Contents
           EOF
           
-          echo "- **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> X659B_DUMP_REPORT.md
-          echo "- **Run ID:** ${{ github.run_id }}" >> X659B_DUMP_REPORT.md
           echo "" >> X659B_DUMP_REPORT.md
-          
-          echo "## Extracted Partitions" >> X659B_DUMP_REPORT.md
+          echo "### System Partition" >> X659B_DUMP_REPORT.md
+          echo "Files: $(find ${{ env.WORK_DIR }}/system_files -type f 2>/dev/null | wc -l)" >> X659B_DUMP_REPORT.md
           echo "" >> X659B_DUMP_REPORT.md
-          ls -lh ${{ env.WORK_DIR }}/extracted_rom/super_extracted/ >> X659B_DUMP_REPORT.md 2>/dev/null || echo "See artifacts" >> X659B_DUMP_REPORT.md
-          
-          echo "" >> X659B_DUMP_REPORT.md
-          echo "## System Files" >> X659B_DUMP_REPORT.md
-          find ${{ env.WORK_DIR }}/extracted_rom/super_extracted/system_files -type f 2>/dev/null | wc -l | xargs -I {} echo "Total files: {}" >> X659B_DUMP_REPORT.md || echo "Extraction incomplete" >> X659B_DUMP_REPORT.md
+          echo "### Other Partitions" >> X659B_DUMP_REPORT.md
+          for part in vendor product system_ext odm; do
+            if [ -d "${{ env.WORK_DIR }}/${part}_files" ]; then
+              count=$(find ${{ env.WORK_DIR }}/${part}_files -type f 2>/dev/null | wc -l)
+              echo "- $part: $count files" >> X659B_DUMP_REPORT.md
+            fi
+          done
           
           cat X659B_DUMP_REPORT.md
 
-      # ERROR FIX #16: Upload with retry and comprehensive artifact collection
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: X659B-Firmware-Dump-${{ github.run_number }}
+          name: X659B-7Zip-Extraction-${{ github.run_number }}
           path: |
-            ${{ env.DUMP_DIR }}/
+            ${{ env.WORK_DIR }}/system_files/
+            ${{ env.WORK_DIR }}/vendor_files/
+            ${{ env.WORK_DIR }}/product_files/
             ${{ env.WORK_DIR }}/extracted_rom/super_extracted/
+            ${{ env.DUMP_DIR }}/
             ${{ github.workspace }}/phoenix_dump.log
-            ${{ env.WORK_DIR }}/extracted_rom/*.img
           retention-days: 7
           if-no-files-found: warn
-          compression-level: 6  # Balance between size and speed
 
-      # ERROR FIX #17: Release creation with error handling
       - name: Create Release
         if: github.event.inputs.upload_to_github == 'true' && success()
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: x659b-dump-${{ github.run_number }}-${{ github.run_attempt }}
-          name: X659B Firmware Dump #${{ github.run_number }}
- 
+          tag_name: x659b-7zip-dump-${{ github.run_number }}
+          name: X659B 7Zip Extraction #${{ github.run_number }}
+          body_path: ${{ env.DUMP_DIR }}/X659B_DUMP_REPORT.md
+          files: |
+            ${{ env.DUMP_DIR }}/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo umount /tmp/system_mount /tmp/vendor_mnt /tmp/product_mnt 2>/dev/null || true
+          rm -rf ${{ env.WORK_DIR }} || true
+          
