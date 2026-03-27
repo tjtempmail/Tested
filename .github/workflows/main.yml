@@ -1,346 +1,293 @@
-name: X659B Firmware Extractor - 7ZIP METHOD
+name: Kernel Source Tree Analysis ☠️
 
 on:
   workflow_dispatch:
     inputs:
-      upload_to_github:
-        description: 'Create GitHub Release'
+      kernel_url:
+        description: 'Kernel Source Git URL'
+        required: true
+        default: 'https://github.com/SakthivelNadar/android_kernel_redmi_mt6768'
+      branch:
+        description: 'Branch name (default: main or master)'
         required: false
-        default: 'true'
-        type: boolean
-
-env:
-  FIRMWARE_URL: "https://archive.org/download/infinix-hot-10i-x659b-stock-rom-firmware/R2-Infinix-Hot-10i-X659B-14.zip"
-  FIRMWARE_FILENAME: "R2-Infinix-Hot-10i-X659B-14.zip"
-  WORK_DIR: ${{ github.workspace }}/firmware_work
-  DUMP_DIR: ${{ github.workspace }}/dump_output
+        default: ''
+      depth:
+        description: 'Clone depth (1 for shallow, 0 for full)'
+        required: false
+        default: '1'
 
 jobs:
-  firmware-process:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 240
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     
     steps:
-      - name: Free Up Disk Space
-        run: |
-          echo "🧹 Freeing up disk space..."
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo rm -rf "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
-          sudo apt-get clean && sudo apt-get autoremove -y
-          df -h
-
-      - name: Checkout Repository
+      # ==========================================
+      # STEP 1: Checkout workflow repo
+      # ==========================================
+      - name: Checkout workflow repository
         uses: actions/checkout@v4
-
-      - name: Install Dependencies
+      
+      # ==========================================
+      # STEP 2: Install dependencies
+      # ==========================================
+      - name: Install tree and other tools
         run: |
+          echo "☠️ Installing dependencies..."
           sudo apt-get update
-          sudo apt-get install -y \
-            aria2 p7zip-full p7zip-rar unzip unrar \
-            simg2img e2fsprogs file tree pv curl wget \
-            python3 python3-pip git cpio xz-utils \
-            liblz4-tool brotli binwalk
-            
-          pip3 install --user protobuf pycryptodome
-
-      - name: Create Working Directories
-        run: |
-          mkdir -p ${{ env.WORK_DIR }}/extracted_rom
-          mkdir -p ${{ env.WORK_DIR }}/super_extracted
-          mkdir -p ${{ env.WORK_DIR }}/system_files
-          mkdir -p ${{ env.DUMP_DIR }}
-
-      # ERROR FIX: Robust download with Archive.org optimizations
-      - name: Download Firmware
-        working-directory: ${{ env.WORK_DIR }}
-        run: |
-          echo "🚀 Downloading firmware..."
+          sudo apt-get install -y tree git wget curl
           
-          cat > aria2.conf << 'EOF'
-          max-connection-per-server=4
-          min-split-size=50M
-          split=4
-          max-concurrent-downloads=2
-          connect-timeout=120
-          timeout=600
-          retry-wait=15
-          max-tries=10
-          continue=true
-          max-download-limit=5M
-          user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36
+          # Verify installation
+          tree --version
+          git --version
+          
+          echo "✅ Dependencies installed"
+      
+      # ==========================================
+      # STEP 3: Clone kernel source
+      # ==========================================
+      - name: Clone kernel source
+        id: clone
+        run: |
+          KERNEL_URL="${{ github.event.inputs.kernel_url }}"
+          BRANCH="${{ github.event.inputs.branch }}"
+          DEPTH="${{ github.event.inputs.depth }}"
+          
+          echo "☠️ Cloning kernel from: $KERNEL_URL"
+          echo "Branch: ${BRANCH:-default}"
+          echo "Depth: $DEPTH"
+          
+          # Determine clone command
+          if [ "$DEPTH" = "0" ] || [ "$DEPTH" = "full" ]; then
+            DEPTH_FLAG=""
+          else
+            DEPTH_FLAG="--depth=$DEPTH"
+          fi
+          
+          if [ -n "$BRANCH" ]; then
+            BRANCH_FLAG="--branch=$BRANCH"
+          else
+            BRANCH_FLAG=""
+          fi
+          
+          # Clone with progress
+          git clone $DEPTH_FLAG $BRANCH_FLAG --single-branch "$KERNEL_URL" kernel-source 2>&1 | tee clone.log
+          
+          # Get repo info
+          cd kernel-source
+          REPO_NAME=$(basename -s .git $(git remote get-url origin))
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          COMMIT_DATE=$(git log -1 --format=%cd --date=short)
+          BRANCH_NAME=$(git branch --show-current)
+          
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+          echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+          echo "commit_date=$COMMIT_DATE" >> $GITHUB_OUTPUT
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          
+          echo "✅ Cloned: $REPO_NAME"
+          echo "   Commit: $COMMIT_HASH"
+          echo "   Date: $COMMIT_DATE"
+          echo "   Branch: $BRANCH_NAME"
+      
+      # ==========================================
+      # STEP 4: Generate tree output
+      # ==========================================
+      - name: Generate tree structure
+        id: tree
+        run: |
+          echo "☠️ Generating tree structure..."
+          
+          cd kernel-source
+          
+          # Full tree with details
+          echo "=== FULL DIRECTORY TREE ===" > ../kernel-tree-full.txt
+          echo "Repository: ${{ steps.clone.outputs.repo_name }}" >> ../kernel-tree-full.txt
+          echo "Commit: ${{ steps.clone.outputs.commit_hash }}" >> ../kernel-tree-full.txt
+          echo "Date: ${{ steps.clone.outputs.commit_date }}" >> ../kernel-tree-full.txt
+          echo "URL: ${{ github.event.inputs.kernel_url }}" >> ../kernel-tree-full.txt
+          echo "========================================" >> ../kernel-tree-full.txt
+          echo "" >> ../kernel-tree-full.txt
+          
+          # Run tree with all files
+          tree -a -L 3 --charset ascii >> ../kernel-tree-full.txt 2>&1 || \
+          (find . -maxdepth 3 -type d | sort >> ../kernel-tree-full.txt && \
+           find . -maxdepth 3 -type f | head -500 >> ../kernel-tree-full.txt)
+          
+          # Compact tree (directories only)
+          echo "=== DIRECTORY STRUCTURE ONLY ===" > ../kernel-tree-dirs.txt
+          tree -d -L 4 --charset ascii >> ../kernel-tree-dirs.txt 2>&1 || \
+          find . -maxdepth 4 -type d | sort >> ../kernel-tree-dirs.txt
+          
+          # Stats
+          echo "=== STATISTICS ===" > ../kernel-tree-stats.txt
+          echo "Total directories: $(find . -type d | wc -l)" >> ../kernel-tree-stats.txt
+          echo "Total files: $(find . -type f | wc -l)" >> ../kernel-tree-stats.txt
+          echo "Total size: $(du -sh . | cut -f1)" >> ../kernel-tree-stats.txt
+          echo "" >> ../kernel-tree-stats.txt
+          
+          echo "File types:" >> ../kernel-tree-stats.txt
+          find . -type f | sed 's/.*\.//' | sort | uniq -c | sort -rn | head -20 >> ../kernel-tree-stats.txt
+          
+          # Key kernel files check
+          echo "" >> ../kernel-tree-stats.txt
+          echo "=== KEY KERNEL FILES ===" >> ../kernel-tree-stats.txt
+          [ -f "Makefile" ] && echo "✅ Makefile present" >> ../kernel-tree-stats.txt || echo "❌ Makefile missing" >> ../kernel-tree-stats.txt
+          [ -f "Kconfig" ] && echo "✅ Kconfig present" >> ../kernel-tree-stats.txt || echo "❌ Kconfig missing" >> ../kernel-tree-stats.txt
+          [ -d "arch/arm64" ] && echo "✅ ARM64 architecture" >> ../kernel-tree-stats.txt || echo "❌ ARM64 missing" >> ../kernel-tree-stats.txt
+          [ -d "drivers" ] && echo "✅ Drivers directory" >> ../kernel-tree-stats.txt || echo "❌ Drivers missing" >> ../kernel-tree-stats.txt
+          [ -d "include/linux" ] && echo "✅ Linux headers" >> ../kernel-tree-stats.txt || echo "❌ Headers missing" >> ../kernel-tree-stats.txt
+          
+          # Defconfigs list
+          echo "" >> ../kernel-tree-stats.txt
+          echo "=== AVAILABLE DEFCONFIGS ===" >> ../kernel-tree-stats.txt
+          find arch -name "*_defconfig" 2>/dev/null | head -20 >> ../kernel-tree-stats.txt || echo "No defconfigs found" >> ../kernel-tree-stats.txt
+          
+          # DTS files
+          echo "" >> ../kernel-tree-stats.txt
+          echo "=== DEVICE TREE SOURCES ===" >> ../kernel-tree-stats.txt
+          find arch -name "*.dts" -o -name "*.dtsi" 2>/dev/null | head -20 >> ../kernel-tree-stats.txt || echo "No DTS files found" >> ../kernel-tree-stats.txt
+          
+          echo "✅ Tree analysis complete"
+          
+          # List output files
+          ls -lh ../kernel-tree-*.txt
+      
+      # ==========================================
+      # STEP 5: Create combined report
+      # ==========================================
+      - name: Create analysis report
+        run: |
+          echo "☠️ Creating final report..."
+          
+          REPORT_FILE="KERNEL-TREE-ANALYSIS-${{ steps.clone.outputs.repo_name }}-${{ steps.clone.outputs.commit_hash }}.txt"
+          
+          cat kernel-tree-stats.txt > "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          echo "========================================" >> "$REPORT_FILE"
+          cat kernel-tree-dirs.txt >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          echo "========================================" >> "$REPORT_FILE"
+          echo "FULL FILE LISTING (First 1000 lines):" >> "$REPORT_FILE"
+          head -1000 kernel-tree-full.txt >> "$REPORT_FILE"
+          
+          # Create JSON metadata
+          cat > metadata.json << EOF
+          {
+            "repository": "${{ steps.clone.outputs.repo_name }}",
+            "url": "${{ github.event.inputs.kernel_url }}",
+            "branch": "${{ steps.clone.outputs.branch_name }}",
+            "commit_hash": "${{ steps.clone.outputs.commit_hash }}",
+            "commit_date": "${{ steps.clone.outputs.commit_date }}",
+            "analysis_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "workflow_run_id": "${{ github.run_id }}",
+            "triggered_by": "${{ github.actor }}"
+          }
           EOF
           
-          for attempt in 1 2 3; do
-            echo "Attempt $attempt..."
-            aria2c --conf-path=aria2.conf \
-              --dir=${{ env.WORK_DIR }} \
-              --out=${{ env.FIRMWARE_FILENAME }} \
-              "${{ env.FIRMWARE_URL }}" && break
-            sleep 30
-          done
+          echo "report_file=$REPORT_FILE" >> $GITHUB_OUTPUT
           
-          ls -lh ${{ env.FIRMWARE_FILENAME }}
-
-      # ERROR FIX: Multi-method extraction
-      - name: Extract Firmware Archive
-        working-directory: ${{ env.WORK_DIR }}
-        run: |
-          echo "📦 Extracting archive..."
-          
-          # Try 7z first
-          if 7z x ${{ env.FIRMWARE_FILENAME }} -oextracted_rom -y -bb0; then
-            echo "✅ 7z extraction successful"
-          elif unzip -q ${{ env.FIRMWARE_FILENAME }} -d extracted_rom; then
-            echo "✅ unzip successful"
-          else
-            echo "❌ Extraction failed"
-            exit 1
-          fi
-          
-          # Find super.img
-          find extracted_rom/ -name "super.img" -type f
-
-      # MAIN METHOD: Use 7zip to extract super.img contents
-      - name: Extract Super.img Using 7ZIP
-        working-directory: ${{ env.WORK_DIR }}/extracted_rom
-        run: |
-          echo "🔧 Extracting super.img with 7ZIP..."
-          
-          SUPER_IMG=$(find . -name "super.img" -type f | head -1)
-          if [ -z "$SUPER_IMG" ]; then
-            echo "❌ super.img not found"
-            exit 1
-          fi
-          
-          echo "Found: $SUPER_IMG ($(ls -lh $SUPER_IMG | awk '{print $5}'))"
-          file "$SUPER_IMG"
-          
-          # Check magic to see if sparse
-          MAGIC=$(xxd -l 4 "$SUPER_IMG" | awk '{print $2}')
-          echo "Magic bytes: $MAGIC"
-          
-          # Convert sparse to raw if needed
-          if echo "$MAGIC" | grep -qv "3aff"; then
-            echo "🔄 Converting sparse to raw..."
-            simg2img "$SUPER_IMG" super_raw.img || {
-              echo "⚠️ simg2img failed, copying as-is"
-              cp "$SUPER_IMG" super_raw.img
-            }
-          else
-            cp "$SUPER_IMG" super_raw.img
-          fi
-          
-          ls -lh super_raw.img
-          
-          # METHOD 1: Try 7z direct extraction on raw super.img
-          echo "📦 Method 1: 7z direct extraction..."
-          mkdir -p super_7z_extracted
-          7z x super_raw.img -osuper_7z_extracted -y || echo "⚠️ 7z direct extraction had issues"
-          
-          # Check what we got
-          echo "7z extraction results:"
-          find super_7z_extracted/ -type f -name "*.img" 2>/dev/null | head -20
-          
-          # If 7z found internal images, extract them
-          if [ -d "super_7z_extracted" ]; then
-            # Look for nested images (0.img, 1.img, etc. which are partitions)
-            for img in super_7z_extracted/*.img super_7z_extracted/*/*.img; do
-              if [ -f "$img" ]; then
-                name=$(basename "$img" .img)
-                echo "Processing nested image: $name"
-                mkdir -p "super_extracted/${name}_files"
-                
-                # Try to extract this partition image with 7z
-                7z x "$img" -o"super_extracted/${name}_files" -y || {
-                  # If 7z fails, might be raw ext4, try mount
-                  echo "  7z failed, attempting mount..."
-                  mkdir -p "super_extracted/${name}_mount"
-                  sudo mount -o loop,ro "$img" "super_extracted/${name}_mount" 2>/dev/null && {
-                    sudo cp -a "super_extracted/${name}_mount"/* "super_extracted/${name}_files"/
-                    sudo umount "super_extracted/${name}_mount"
-                  } || echo "  Mount also failed for $name"
-                }
-              fi
-            done
-          fi
-          
-          # METHOD 2: If 7z didn't work well, try binwalk extraction
-          if [ ! "$(ls -A super_extracted/ 2>/dev/null)" ]; then
-            echo "📦 Method 2: Binwalk extraction..."
-            binwalk -e super_raw.img -C super_binwalk/ || true
-            
-            # Move extracted files
-            find super_binwalk/ -name "*.img" -exec cp {} super_extracted/ \; 2>/dev/null || true
-          fi
-          
-          echo "✅ Final extraction results:"
-          ls -lhR super_extracted/ | head -50
-
-      # ERROR FIX: Deep extract system partition with 7z fallback
-      - name: Deep Extract System Partition
-        working-directory: ${{ env.WORK_DIR }}/extracted_rom
-        run: |
-          echo "🔍 Deep extracting system partition..."
-          
-          # Find system image (various naming conventions)
-          SYSTEM_IMG=$(find super_extracted/ super_7z_extracted/ -name "*system*.img" -o -name "0.img" -o -name "1.img" | head -1)
-          
-          if [ -z "$SYSTEM_IMG" ]; then
-            echo "⚠️ No system image found for deep extraction"
-            exit 0
-          fi
-          
-          echo "Found system image: $SYSTEM_IMG ($(ls -lh $SYSTEM_IMG | awk '{print $5}'))"
-          file "$SYSTEM_IMG"
-          
-          # Create output directory
-          mkdir -p ${{ env.WORK_DIR }}/system_files
-          
-          # METHOD 1: Try 7z extraction (works for ext4 images) [^74^][^75^]
-          echo "Trying 7z extraction on system image..."
-          7z x "$SYSTEM_IMG" -o${{ env.WORK_DIR }}/system_files -y || {
-            echo "⚠️ 7z extraction failed, trying mount..."
-            
-            # METHOD 2: Mount as fallback
-            mkdir -p /tmp/system_mount
-            if sudo mount -o loop,ro "$SYSTEM_IMG" /tmp/system_mount 2>/dev/null; then
-              echo "✅ Mounted, copying files..."
-              sudo cp -a /tmp/system_mount/* ${{ env.WORK_DIR }}/system_files/
-              sudo umount /tmp/system_mount
-            else
-              echo "⚠️ Mount failed, trying simg2img + 7z..."
-              
-              # METHOD 3: Convert if sparse then try 7z again
-              simg2img "$SYSTEM_IMG" /tmp/system_raw.img 2>/dev/null && {
-                7z x /tmp/system_raw.img -o${{ env.WORK_DIR }}/system_files -y || \
-                sudo mount -o loop,ro /tmp/system_raw.img /tmp/system_mount && \
-                sudo cp -a /tmp/system_mount/* ${{ env.WORK_DIR }}/system_files/ && \
-                sudo umount /tmp/system_mount
-              }
-            fi
-          }
-          
-          # Count extracted files
-          FILE_COUNT=$(find ${{ env.WORK_DIR }}/system_files -type f 2>/dev/null | wc -l)
-          echo "✅ Extracted $FILE_COUNT files from system partition"
-          
-          # List top-level directories
-          ls -la ${{ env.WORK_DIR }}/system_files/ | head -20
-
-      # ERROR FIX: Process other partitions
-      - name: Extract Vendor and Product Partitions
-        working-directory: ${{ env.WORK_DIR }}/extracted_rom
-        run: |
-          echo "🔧 Extracting vendor and product partitions..."
-          
-          for part in vendor product system_ext odm; do
-            IMG=$(find super_extracted/ super_7z_extracted/ -name "*${part}*.img" | head -1)
-            if [ -n "$IMG" ]; then
-              echo "Extracting $part from $IMG..."
-              mkdir -p ${{ env.WORK_DIR }}/${part}_files
-              
-              # Try 7z first
-              7z x "$IMG" -o${{ env.WORK_DIR }}/${part}_files -y || {
-                # Fallback to mount
-                mkdir -p /tmp/${part}_mnt
-                sudo mount -o loop,ro "$IMG" /tmp/${part}_mnt 2>/dev/null && {
-                  sudo cp -a /tmp/${part}_mnt/* ${{ env.WORK_DIR }}/${part}_files/
-                  sudo umount /tmp/${part}_mnt
-                } || echo "⚠️ Could not extract $part"
-              }
-            fi
-          done
-
-      - name: Setup Phoenix Firmware Dumper
-        run: |
-          echo "🐦 Setting up Phoenix Dumper..."
-          git clone --depth 1 https://github.com/DroidDumps/phoenix_firmware_dumper.git ${{ github.workspace }}/phoenix_dumper
-          cd ${{ github.workspace }}/phoenix_dumper
-          chmod +x *.sh
-          ./setup.sh || echo "⚠️ Setup warnings, continuing..."
-
-      - name: Run Phoenix Firmware Dumper
-        working-directory: ${{ github.workspace }}/phoenix_dumper
-        run: |
-          echo "🚀 Running Phoenix Dumper..."
-          
-          if [ "${{ github.event.inputs.upload_to_github }}" = "true" ]; then
-            echo "${{ secrets.GITHUB_TOKEN }}" > .github_token
-            echo "${{ github.repository_owner }}" > .github_orgname
-          fi
-          
-          timeout 3600 ./dumper.sh "${{ env.WORK_DIR }}/extracted_rom" 2>&1 | tee ${{ github.workspace }}/phoenix_dump.log || {
-            echo "⚠️ Dumper had issues, using our 7z extraction instead"
-          }
-          
-          cp -r output/* ${{ env.DUMP_DIR }}/ 2>/dev/null || true
-
-      - name: Generate Report
-        working-directory: ${{ env.DUMP_DIR }}
-        run: |
-          cat > X659B_DUMP_REPORT.md << EOF
-          # Infinix Hot 10i (X659B) Firmware Dump Report
-          
-          ## Device Information
-          - **Device:** Infinix Hot 10i
-          - **Model:** X659B-OP
-          - **Codename:** X659B
-          - **Chipset:** MediaTek MT6768 (Helio P65)
-          - **Android Version:** 11 (API 30)
-          - **Extraction Method:** 7ZIP + Mount Fallback
-          
-          ## Extraction Summary
-          - **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          - **Firmware:** ${{ env.FIRMWARE_FILENAME }}
-          
-          ## Extracted Contents
-          EOF
-          
-          echo "" >> X659B_DUMP_REPORT.md
-          echo "### System Partition" >> X659B_DUMP_REPORT.md
-          echo "Files: $(find ${{ env.WORK_DIR }}/system_files -type f 2>/dev/null | wc -l)" >> X659B_DUMP_REPORT.md
-          echo "" >> X659B_DUMP_REPORT.md
-          echo "### Other Partitions" >> X659B_DUMP_REPORT.md
-          for part in vendor product system_ext odm; do
-            if [ -d "${{ env.WORK_DIR }}/${part}_files" ]; then
-              count=$(find ${{ env.WORK_DIR }}/${part}_files -type f 2>/dev/null | wc -l)
-              echo "- $part: $count files" >> X659B_DUMP_REPORT.md
-            fi
-          done
-          
-          cat X659B_DUMP_REPORT.md
-
-      - name: Upload Artifacts
+          ls -lh *.txt *.json 2>/dev/null || true
+      
+      # ==========================================
+      # STEP 6: Upload artifacts
+      # ==========================================
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: X659B-7Zip-Extraction-${{ github.run_number }}
+          name: kernel-tree-analysis-${{ steps.clone.outputs.repo_name }}
           path: |
-            ${{ env.WORK_DIR }}/system_files/
-            ${{ env.WORK_DIR }}/vendor_files/
-            ${{ env.WORK_DIR }}/product_files/
-            ${{ env.WORK_DIR }}/extracted_rom/super_extracted/
-            ${{ env.DUMP_DIR }}/
-            ${{ github.workspace }}/phoenix_dump.log
-          retention-days: 7
-          if-no-files-found: warn
-
+            kernel-tree-*.txt
+            KERNEL-TREE-ANALYSIS-*.txt
+            metadata.json
+            clone.log
+          retention-days: 30
+      
+      # ==========================================
+      # STEP 7: Create Release
+      # ==========================================
       - name: Create Release
-        if: github.event.inputs.upload_to_github == 'true' && success()
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: x659b-7zip-dump-${{ github.run_number }}
-          name: X659B 7Zip Extraction #${{ github.run_number }}
-          body_path: ${{ env.DUMP_DIR }}/X659B_DUMP_REPORT.md
-          files: |
-            ${{ env.DUMP_DIR }}/*
+        id: create_release
+        uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
-
-      - name: Cleanup
-        if: always()
+        with:
+          tag_name: kernel-analysis-${{ steps.clone.outputs.repo_name }}-${{ steps.clone.outputs.commit_hash }}-${{ github.run_number }}
+          release_name: ☠️ Kernel Tree Analysis - ${{ steps.clone.outputs.repo_name }} (${{ steps.clone.outputs.commit_hash }})
+          body: |
+            ## 🔥 Kernel Source Tree Analysis
+            
+            **Repository:** ${{ steps.clone.outputs.repo_name }}
+            **Source URL:** ${{ github.event.inputs.kernel_url }}
+            **Branch:** ${{ steps.clone.outputs.branch_name }}
+            **Commit:** ${{ steps.clone.outputs.commit_hash }}
+            **Date:** ${{ steps.clone.outputs.commit_date }}
+            
+            ### 📊 Analysis Summary
+            - Full directory structure
+            - File statistics
+            - Key kernel components check
+            - Available defconfigs
+            - Device tree sources
+            
+            ### 📁 Files Included
+            - `kernel-tree-full.txt` - Complete file listing
+            - `kernel-tree-dirs.txt` - Directory structure only
+            - `kernel-tree-stats.txt` - Statistics and key files
+            - `KERNEL-TREE-ANALYSIS-*.txt` - Combined report
+            
+            ### ☠️ Generated by GitHub Actions
+            Workflow Run: ${{ github.run_id }}
+            Triggered by: ${{ github.actor }}
+            Date: ${{ github.event.repository.updated_at }}
+          draft: false
+          prerelease: false
+      
+      # ==========================================
+      # STEP 8: Upload to Release
+      # ==========================================
+      - name: Upload Release Assets
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./KERNEL-TREE-ANALYSIS-${{ steps.clone.outputs.repo_name }}-${{ steps.clone.outputs.commit_hash }}.txt
+          asset_name: KERNEL-TREE-ANALYSIS-${{ steps.clone.outputs.repo_name }}-${{ steps.clone.outputs.commit_hash }}.txt
+          asset_content_type: text/plain
+      
+      - name: Upload Stats to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./kernel-tree-stats.txt
+          asset_name: kernel-tree-stats.txt
+          asset_content_type: text/plain
+      
+      - name: Upload Metadata to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./metadata.json
+          asset_name: metadata.json
+          asset_content_type: application/json
+      
+      # ==========================================
+      # STEP 9: Summary
+      # ==========================================
+      - name: Workflow Summary
         run: |
-          sudo umount /tmp/system_mount /tmp/vendor_mnt /tmp/product_mnt 2>/dev/null || true
-          rm -rf ${{ env.WORK_DIR }} || true
+          echo "☠️ KERNEL TREE ANALYSIS COMPLETE ☠️"
+          echo ""
+          echo "Repository: ${{ steps.clone.outputs.repo_name }}"
+          echo "Commit: ${{ steps.clone.outputs.commit_hash }}"
+          echo ""
+          echo "📁 Output Files:"
+          ls -lh kernel-tree-*.txt KERNEL-TREE-ANALYSIS-*.txt metadata.json 2>/dev/null || true
+          echo ""
+          echo "🔗 Release URL: ${{ steps.create_release.outputs.html_url }}"
           
