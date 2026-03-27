@@ -8,11 +8,11 @@ on:
         required: true
         default: 'https://github.com/SakthivelNadar/android_kernel_redmi_mt6768'
       branch:
-        description: 'Branch name (default: main or master)'
+        description: 'Branch name (leave empty for default)'
         required: false
         default: ''
       depth:
-        description: 'Clone depth (1 for shallow, 0 for full)'
+        description: 'Clone depth (1=shallow, 0=full)'
         required: false
         default: '1'
 
@@ -31,16 +31,14 @@ jobs:
       # ==========================================
       # STEP 2: Install dependencies
       # ==========================================
-      - name: Install tree and other tools
+      - name: Install tree and tools
         run: |
           echo "☠️ Installing dependencies..."
           sudo apt-get update
-          sudo apt-get install -y tree git wget curl
+          sudo apt-get install -y tree git wget curl coreutils
           
-          # Verify installation
           tree --version
           git --version
-          
           echo "✅ Dependencies installed"
       
       # ==========================================
@@ -54,31 +52,26 @@ jobs:
           DEPTH="${{ github.event.inputs.depth }}"
           
           echo "☠️ Cloning kernel from: $KERNEL_URL"
-          echo "Branch: ${BRANCH:-default}"
-          echo "Depth: $DEPTH"
           
-          # Determine clone command
-          if [ "$DEPTH" = "0" ] || [ "$DEPTH" = "full" ]; then
-            DEPTH_FLAG=""
-          else
-            DEPTH_FLAG="--depth=$DEPTH"
+          # Build clone command
+          CLONE_CMD="git clone"
+          if [ "$DEPTH" != "0" ] && [ "$DEPTH" != "full" ]; then
+            CLONE_CMD="$CLONE_CMD --depth=$DEPTH"
           fi
-          
           if [ -n "$BRANCH" ]; then
-            BRANCH_FLAG="--branch=$BRANCH"
-          else
-            BRANCH_FLAG=""
+            CLONE_CMD="$CLONE_CMD --branch=$BRANCH"
           fi
+          CLONE_CMD="$CLONE_CMD --single-branch \"$KERNEL_URL\" kernel-source"
           
-          # Clone with progress
-          git clone $DEPTH_FLAG $BRANCH_FLAG --single-branch "$KERNEL_URL" kernel-source 2>&1 | tee clone.log
+          echo "Running: $CLONE_CMD"
+          eval $CLONE_CMD 2>&1 | tee clone.log
           
           # Get repo info
           cd kernel-source
-          REPO_NAME=$(basename -s .git $(git remote get-url origin))
-          COMMIT_HASH=$(git rev-parse --short HEAD)
-          COMMIT_DATE=$(git log -1 --format=%cd --date=short)
-          BRANCH_NAME=$(git branch --show-current)
+          REPO_NAME=$(basename -s .git $(git remote get-url origin) 2>/dev/null || echo "unknown")
+          COMMIT_HASH=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          COMMIT_DATE=$(git log -1 --format=%cd --date=short 2>/dev/null || echo "unknown")
+          BRANCH_NAME=$(git branch --show-current 2>/dev/null || git describe --contains --all HEAD 2>/dev/null || echo "unknown")
           
           echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
           echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
@@ -91,7 +84,7 @@ jobs:
           echo "   Branch: $BRANCH_NAME"
       
       # ==========================================
-      # STEP 4: Generate tree output
+      # STEP 4: Generate tree output (FIXED)
       # ==========================================
       - name: Generate tree structure
         id: tree
@@ -100,7 +93,7 @@ jobs:
           
           cd kernel-source
           
-          # Full tree with details
+          # Create full tree (handle large repos gracefully)
           echo "=== FULL DIRECTORY TREE ===" > ../kernel-tree-full.txt
           echo "Repository: ${{ steps.clone.outputs.repo_name }}" >> ../kernel-tree-full.txt
           echo "Commit: ${{ steps.clone.outputs.commit_hash }}" >> ../kernel-tree-full.txt
@@ -109,36 +102,54 @@ jobs:
           echo "========================================" >> ../kernel-tree-full.txt
           echo "" >> ../kernel-tree-full.txt
           
-          # Run tree with all files
-          tree -a -L 3 --charset ascii >> ../kernel-tree-full.txt 2>&1 || \
-          (find . -maxdepth 3 -type d | sort >> ../kernel-tree-full.txt && \
-           find . -maxdepth 3 -type f | head -500 >> ../kernel-tree-full.txt)
+          # Use tree with limited depth to avoid broken pipe
+          if command -v tree &> /dev/null; then
+            echo "Using tree command..."
+            tree -a -L 2 --charset ascii >> ../kernel-tree-full.txt 2>/dev/null || \
+            tree -a -L 1 >> ../kernel-tree-full.txt 2>/dev/null || \
+            echo "Tree command failed" >> ../kernel-tree-full.txt
+          else
+            echo "Tree not available, using find..." >> ../kernel-tree-full.txt
+          fi
           
-          # Compact tree (directories only)
-          echo "=== DIRECTORY STRUCTURE ONLY ===" > ../kernel-tree-dirs.txt
-          tree -d -L 4 --charset ascii >> ../kernel-tree-dirs.txt 2>&1 || \
-          find . -maxdepth 4 -type d | sort >> ../kernel-tree-dirs.txt
+          # Add file listing (top level only in full tree)
+          echo "" >> ../kernel-tree-full.txt
+          echo "=== TOP-LEVEL FILES ===" >> ../kernel-tree-full.txt
+          ls -la >> ../kernel-tree-full.txt
           
-          # Stats
+          # Directory-only tree
+          echo "=== DIRECTORY STRUCTURE ===" > ../kernel-tree-dirs.txt
+          if command -v tree &> /dev/null; then
+            tree -d -L 3 --charset ascii >> ../kernel-tree-dirs.txt 2>/dev/null || \
+            find . -maxdepth 3 -type d | head -200 >> ../kernel-tree-dirs.txt
+          else
+            find . -maxdepth 3 -type d | head -200 >> ../kernel-tree-dirs.txt
+          fi
+          
+          # Statistics (avoid broken pipe with head)
           echo "=== STATISTICS ===" > ../kernel-tree-stats.txt
-          echo "Total directories: $(find . -type d | wc -l)" >> ../kernel-tree-stats.txt
-          echo "Total files: $(find . -type f | wc -l)" >> ../kernel-tree-stats.txt
-          echo "Total size: $(du -sh . | cut -f1)" >> ../kernel-tree-stats.txt
+          echo "Total directories: $(find . -type d 2>/dev/null | wc -l)" >> ../kernel-tree-stats.txt
+          echo "Total files: $(find . -type f 2>/dev/null | wc -l)" >> ../kernel-tree-stats.txt
+          echo "Total size: $(du -sh . 2>/dev/null | cut -f1)" >> ../kernel-tree-stats.txt
           echo "" >> ../kernel-tree-stats.txt
           
-          echo "File types:" >> ../kernel-tree-stats.txt
-          find . -type f | sed 's/.*\.//' | sort | uniq -c | sort -rn | head -20 >> ../kernel-tree-stats.txt
+          # File types (safe approach)
+          echo "Top file types:" >> ../kernel-tree-stats.txt
+          find . -type f -name "*.*" 2>/dev/null | sed 's/.*\.//' | tr '[:upper:]' '[:lower:]' | sort | uniq -c | sort -rn | head -15 >> ../kernel-tree-stats.txt || true
           
           # Key kernel files check
           echo "" >> ../kernel-tree-stats.txt
           echo "=== KEY KERNEL FILES ===" >> ../kernel-tree-stats.txt
           [ -f "Makefile" ] && echo "✅ Makefile present" >> ../kernel-tree-stats.txt || echo "❌ Makefile missing" >> ../kernel-tree-stats.txt
           [ -f "Kconfig" ] && echo "✅ Kconfig present" >> ../kernel-tree-stats.txt || echo "❌ Kconfig missing" >> ../kernel-tree-stats.txt
+          [ -f "Kbuild" ] && echo "✅ Kbuild present" >> ../kernel-tree-stats.txt || echo "❌ Kbuild missing" >> ../kernel-tree-stats.txt
           [ -d "arch/arm64" ] && echo "✅ ARM64 architecture" >> ../kernel-tree-stats.txt || echo "❌ ARM64 missing" >> ../kernel-tree-stats.txt
           [ -d "drivers" ] && echo "✅ Drivers directory" >> ../kernel-tree-stats.txt || echo "❌ Drivers missing" >> ../kernel-tree-stats.txt
           [ -d "include/linux" ] && echo "✅ Linux headers" >> ../kernel-tree-stats.txt || echo "❌ Headers missing" >> ../kernel-tree-stats.txt
+          [ -d "fs" ] && echo "✅ Filesystem support" >> ../kernel-tree-stats.txt || echo "❌ FS missing" >> ../kernel-tree-stats.txt
+          [ -d "net" ] && echo "✅ Networking stack" >> ../kernel-tree-stats.txt || echo "❌ Net missing" >> ../kernel-tree-stats.txt
           
-          # Defconfigs list
+          # Defconfigs
           echo "" >> ../kernel-tree-stats.txt
           echo "=== AVAILABLE DEFCONFIGS ===" >> ../kernel-tree-stats.txt
           find arch -name "*_defconfig" 2>/dev/null | head -20 >> ../kernel-tree-stats.txt || echo "No defconfigs found" >> ../kernel-tree-stats.txt
@@ -147,6 +158,11 @@ jobs:
           echo "" >> ../kernel-tree-stats.txt
           echo "=== DEVICE TREE SOURCES ===" >> ../kernel-tree-stats.txt
           find arch -name "*.dts" -o -name "*.dtsi" 2>/dev/null | head -20 >> ../kernel-tree-stats.txt || echo "No DTS files found" >> ../kernel-tree-stats.txt
+          
+          # Makefile targets
+          echo "" >> ../kernel-tree-stats.txt
+          echo "=== MAKEFILE TARGETS ===" >> ../kernel-tree-stats.txt
+          grep -E "^[a-zA-Z0-9_-]+:" Makefile 2>/dev/null | head -20 >> ../kernel-tree-stats.txt || true
           
           echo "✅ Tree analysis complete"
           
@@ -157,21 +173,28 @@ jobs:
       # STEP 5: Create combined report
       # ==========================================
       - name: Create analysis report
+        id: report
         run: |
           echo "☠️ Creating final report..."
           
-          REPORT_FILE="KERNEL-TREE-ANALYSIS-${{ steps.clone.outputs.repo_name }}-${{ steps.clone.outputs.commit_hash }}.txt"
+          REPO_NAME="${{ steps.clone.outputs.repo_name }}"
+          COMMIT_HASH="${{ steps.clone.outputs.commit_hash }}"
+          REPORT_FILE="KERNEL-TREE-ANALYSIS-${REPO_NAME}-${COMMIT_HASH}.txt"
           
+          # Combine reports
           cat kernel-tree-stats.txt > "$REPORT_FILE"
           echo "" >> "$REPORT_FILE"
+          echo "========================================" >> "$REPORT_FILE"
+          echo "DIRECTORY STRUCTURE:" >> "$REPORT_FILE"
           echo "========================================" >> "$REPORT_FILE"
           cat kernel-tree-dirs.txt >> "$REPORT_FILE"
           echo "" >> "$REPORT_FILE"
           echo "========================================" >> "$REPORT_FILE"
-          echo "FULL FILE LISTING (First 1000 lines):" >> "$REPORT_FILE"
-          head -1000 kernel-tree-full.txt >> "$REPORT_FILE"
+          echo "FULL TREE (Limited):" >> "$REPORT_FILE"
+          echo "========================================" >> "$REPORT_FILE"
+          head -500 kernel-tree-full.txt >> "$REPORT_FILE"
           
-          # Create JSON metadata
+          # JSON metadata
           cat > metadata.json << EOF
           {
             "repository": "${{ steps.clone.outputs.repo_name }}",
@@ -181,12 +204,14 @@ jobs:
             "commit_date": "${{ steps.clone.outputs.commit_date }}",
             "analysis_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "workflow_run_id": "${{ github.run_id }}",
+            "workflow_run_number": "${{ github.run_number }}",
             "triggered_by": "${{ github.actor }}"
           }
           EOF
           
           echo "report_file=$REPORT_FILE" >> $GITHUB_OUTPUT
           
+          echo "📁 Generated files:"
           ls -lh *.txt *.json 2>/dev/null || true
       
       # ==========================================
@@ -202,6 +227,7 @@ jobs:
             metadata.json
             clone.log
           retention-days: 30
+          if-no-files-found: warn
       
       # ==========================================
       # STEP 7: Create Release
@@ -225,19 +251,21 @@ jobs:
             
             ### 📊 Analysis Summary
             - Full directory structure
-            - File statistics
+            - File statistics  
             - Key kernel components check
             - Available defconfigs
             - Device tree sources
             
             ### 📁 Files Included
-            - `kernel-tree-full.txt` - Complete file listing
-            - `kernel-tree-dirs.txt` - Directory structure only
+            - `kernel-tree-full.txt` - Complete file listing (limited depth)
+            - `kernel-tree-dirs.txt` - Directory structure
             - `kernel-tree-stats.txt` - Statistics and key files
             - `KERNEL-TREE-ANALYSIS-*.txt` - Combined report
+            - `metadata.json` - Analysis metadata
             
             ### ☠️ Generated by GitHub Actions
             Workflow Run: ${{ github.run_id }}
+            Run Number: ${{ github.run_number }}
             Triggered by: ${{ github.actor }}
             Date: ${{ github.event.repository.updated_at }}
           draft: false
@@ -252,8 +280,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./KERNEL-TREE-ANALYSIS-${{ steps.clone.outputs.repo_name }}-${{ steps.clone.outputs.commit_hash }}.txt
-          asset_name: KERNEL-TREE-ANALYSIS-${{ steps.clone.outputs.repo_name }}-${{ steps.clone.outputs.commit_hash }}.txt
+          asset_path: ./${{ steps.report.outputs.report_file }}
+          asset_name: ${{ steps.report.outputs.report_file }}
           asset_content_type: text/plain
       
       - name: Upload Stats to Release
@@ -280,6 +308,7 @@ jobs:
       # STEP 9: Summary
       # ==========================================
       - name: Workflow Summary
+        if: always()
         run: |
           echo "☠️ KERNEL TREE ANALYSIS COMPLETE ☠️"
           echo ""
@@ -287,7 +316,8 @@ jobs:
           echo "Commit: ${{ steps.clone.outputs.commit_hash }}"
           echo ""
           echo "📁 Output Files:"
-          ls -lh kernel-tree-*.txt KERNEL-TREE-ANALYSIS-*.txt metadata.json 2>/dev/null || true
+          ls -lh kernel-tree-*.txt KERNEL-TREE-ANALYSIS-*.txt metadata.json 2>/dev/null || echo "Files not found"
           echo ""
-          echo "🔗 Release URL: ${{ steps.create_release.outputs.html_url }}"
+          echo "🔗 Release: ${{ steps.create_release.outputs.html_url || 'Not created' }}"
+          echo "📦 Artifact: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           
