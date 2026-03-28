@@ -1,56 +1,62 @@
-name: Kernel Source Tree Analysis ☠️
-
-permissions:
-  contents: write
-  actions: read
+name: Download Windows ISO with aria2
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # Manual trigger only
     inputs:
-      kernel_url:
-        description: 'Kernel Source Git URL'
-        required: true
-        default: 'https://github.com/SakthivelNadar/android_kernel_redmi_mt6768'
+      max_concurrent_downloads:
+        description: 'Maximum number of concurrent downloads'
+        required: false
+        default: '4'
+        type: string
+      max_connection_per_server:
+        description: 'Maximum connections per server'
+        required: false
+        default: '8'
+        type: string
 
 jobs:
-  analyze:
+  download:
     runs-on: ubuntu-latest
     
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y tree git
-      
-      - name: Clone and analyze
-        id: analyze
+      - name: Install aria2
         run: |
-          git clone --depth=1 ${{ github.event.inputs.kernel_url }} kernel-source
-          cd kernel-source
-          
-          REPO_NAME=$(basename -s .git ${{ github.event.inputs.kernel_url }})
-          echo "repo=$REPO_NAME" >> $GITHUB_OUTPUT
-          
-          # Generate tree
-          tree -L 2 > ../tree.txt
-          echo "Analysis complete for $REPO_NAME"
-      
-      # ==========================================
-      # MODERN RELEASE APPROACH (Recommended)
-      # ==========================================
-      - name: Create Release with Assets
-        uses: softprops/action-gh-release@v1
+          sudo apt-get update
+          sudo apt-get install -y aria2
+
+      - name: Create download directory
+        run: mkdir -p downloads
+
+      - name: Download ISO with aria2
+        working-directory: downloads
+        run: |
+          aria2c \
+            --max-concurrent-downloads=${{ github.event.inputs.max_concurrent_downloads || '4' }} \
+            --max-connection-per-server=${{ github.event.inputs.max_connection_per_server || '8' }} \
+            --min-split-size=1M \
+            --split=16 \
+            --continue=true \
+            --retry-wait=5 \
+            --max-tries=0 \
+            --timeout=60 \
+            --console-log-level=warn \
+            --summary-interval=30 \
+            --disk-cache=64M \
+            --file-allocation=falloc \
+            --remote-time=true \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0" \
+            "https://drive.massgrave.dev/en-us_windows_10_iot_enterprise_ltsc_2021_x64_dvd_257ad90f.iso"
+
+      - name: Verify download
+        working-directory: downloads
+        run: |
+          ls -lh *.iso
+          sha256sum *.iso || true
+
+      - name: Upload ISO as artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: kernel-${{ steps.analyze.outputs.repo }}-${{ github.run_number }}
-          name: ☠️ Kernel Analysis - ${{ steps.analyze.outputs.repo }}
-          body: |
-            ## Kernel Tree Analysis
-            
-            **URL:** ${{ github.event.inputs.kernel_url }}
-            **Analyzed:** ${{ github.event.repository.updated_at }}
-          files: |
-            tree.txt
-            *.log
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: windows-10-iot-ltsc-2021
+          path: downloads/*.iso
+          retention-days: 1  # Adjust as needed
           
