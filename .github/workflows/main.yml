@@ -107,18 +107,28 @@ jobs:
           
           python3 -m dumpyara firmware.zip
           
-          # Find the working directory created by dumpyara
-          DUMP_DIR=$(find ~/dumpyara -maxdepth 2 -type d -name "*Infinix*" -o -name "*X659B*" -o -name "*working*" | head -1)
+          # CRITICAL FIX: dumpyara outputs to ~/dumpyara/firmware by default
+          # We need the MAIN firmware directory, not a subdirectory like product/ or system/
+          if [ -d "~/dumpyara/firmware" ]; then
+            DUMP_DIR="$HOME/dumpyara/firmware"
+          else
+            # Fallback: find the directory that contains multiple partition folders
+            DUMP_DIR=$(find ~/dumpyara -maxdepth 2 -type d \( -name "system" -o -name "vendor" -o -name "product" \) -printf '%h' | head -1)
+          fi
           
-          if [ -z "$DUMP_DIR" ]; then
+          # Verify we found the right directory (should contain system or build.prop)
+          if [ ! -d "$DUMP_DIR" ]; then
+            echo "Error: Could not find firmware dump directory"
             ls -la ~/dumpyara/
-            DUMP_DIR=$(find ~/dumpyara -maxdepth 3 -type d | grep -v "^/home/runner/dumpyara$" | head -2 | tail -1)
+            exit 1
           fi
           
           echo "Found dump directory: $DUMP_DIR"
           echo "DUMP_DIR=$DUMP_DIR" >> $GITHUB_ENV
           
-          ls -la "$DUMP_DIR" || true
+          # List contents to verify it has partitions
+          echo "Dump directory contents:"
+          ls -la "$DUMP_DIR"
 
       - name: Generate device tree with aospdtgen
         run: |
@@ -130,20 +140,34 @@ jobs:
             exit 1
           fi
           
-          # Run aospdtgen (generates extract-files.sh by default)
+          # Verify the dump has required partitions (system or product or vendor)
+          if [ ! -d "$DUMP_DIR/system" ] && [ ! -d "$DUMP_DIR/product" ] && [ ! -d "$DUMP_DIR/vendor" ]; then
+            echo "Error: Dump directory doesn't contain expected partitions (system, product, or vendor)"
+            echo "Contents of $DUMP_DIR:"
+            ls -la "$DUMP_DIR"
+            exit 1
+          fi
+          
+          # Run aospdtgen
           python3 -m aospdtgen "$DUMP_DIR" -o ~/dumpyara/deviceTree
           
-          # Find generated device tree
+          # Find generated device tree (should be in deviceTree/<codename>/ or deviceTree/)
           DT_DIR=$(find ~/dumpyara/deviceTree -maxdepth 3 -type d -name "${{ env.DEVICE_CODENAME }}" | head -1)
           
           if [ -z "$DT_DIR" ]; then
-            DT_DIR=$(find ~/dumpyara/deviceTree -maxdepth 4 -type d | grep -E "(device|${{ env.DEVICE_CODENAME }})" | head -1)
+            # Maybe it's directly in deviceTree/
+            if [ -f "~/dumpyara/deviceTree/Android.bp" ] || [ -f "~/dumpyara/deviceTree/Android.mk" ]; then
+              DT_DIR="~/dumpyara/deviceTree"
+            else
+              DT_DIR=$(find ~/dumpyara/deviceTree -maxdepth 2 -type f -name "Android.bp" -exec dirname {} \; | head -1)
+            fi
           fi
           
           echo "Device tree location: $DT_DIR"
           echo "DT_DIR=$DT_DIR" >> $GITHUB_ENV
           
           if [ -d "$DT_DIR" ]; then
+            echo "Device tree contents:"
             ls -laR "$DT_DIR"
           fi
 
@@ -156,9 +180,10 @@ jobs:
           if [ -d "$DT_DIR" ]; then
             cp -r "$DT_DIR"/* ~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/ || true
             
-            # Check what files were generated
-            echo "Generated files in device tree:"
+            echo "Files copied to device tree:"
             ls -la ~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/
+          else
+            echo "Warning: Device tree directory not found"
           fi
 
       - name: Run extract-files script
@@ -168,12 +193,11 @@ jobs:
           echo "Checking for extract scripts in $DEVICE_PATH..."
           ls -la "$DEVICE_PATH/" || true
           
-          # CRITICAL FIX: Check for BOTH .sh and .py versions
+          # aospdtgen generates extract-files.sh (shell) by default for LineageOS 21 and below
           if [ -f "$DEVICE_PATH/extract-files.sh" ]; then
-            echo "Found extract-files.sh (aospdtgen default for LineageOS 21 and below)"
+            echo "Found extract-files.sh (aospdtgen default)"
             chmod +x "$DEVICE_PATH/extract-files.sh"
             
-            # Create vendor directory structure
             mkdir -p ~/android/lineage/vendor/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
             
             cd "$DEVICE_PATH"
@@ -198,12 +222,12 @@ jobs:
           echo "Packaging generated device tree and vendor files..."
           
           cd ~/android/lineage
-          tar -czf ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz device/ vendor/ || \
-          tar -czf ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz device/ || \
+          tar -czf ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz device/ vendor/ 2>/dev/null || \
+          tar -czf ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz device/ 2>/dev/null || \
           tar -czf ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz -C ~/dumpyara deviceTree/
           
           cd ~/dumpyara
-          tar -czf ~/firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz working/ --exclude="firmware.zip" || true
+          tar -czf ~/firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz firmware/ --exclude="firmware.zip" 2>/dev/null || true
           
           ls -lh ~/*.tar.gz
 
@@ -213,6 +237,7 @@ jobs:
           name: device-tree-${{ env.DEVICE_CODENAME }}
           path: ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz
           retention-days: 30
+          if-no-files-found: warn
 
       - name: Upload firmware dump artifact
         uses: actions/upload-artifact@v4
@@ -228,16 +253,14 @@ jobs:
           echo "Device Tree Generation Complete"
           echo "=========================================="
           echo "Device: ${{ env.DEVICE_MANUFACTURER }} ${{ env.DEVICE_CODENAME }}"
+          echo "Dump directory: $DUMP_DIR"
           echo ""
           echo "Generated files should include:"
-          echo "- extract-files.sh (shell script for LineageOS 21 and below)"
+          echo "- extract-files.sh (shell script)"
           echo "- setup-makefiles.sh"
           echo "- proprietary-files.txt"
           echo "- BoardConfig.mk"
           echo "- device.mk"
-          echo "- Android.mk"
-          echo ""
-          echo "NOTE: aospdtgen generates SHELL scripts (.sh), not Python (.py)"
-          echo "For LineageOS 22+, you need to manually convert to Python templates"
+          echo "- Android.bp/Android.mk"
           echo "=========================================="
           
