@@ -7,20 +7,10 @@ on:
         description: 'Direct URL to firmware ZIP'
         required: false
         default: 'https://archive.org/download/infinix-hot-10i-x-659-b-04/Infinix-Hot-10i-X659B-04.zip'
-      device_codename:
-        description: 'Device codename (use firmware codename if different)'
-        required: false
-        default: 'x659b'
-      device_manufacturer:
-        description: 'Device manufacturer'
-        required: false
-        default: 'infinix'
 
 env:
   PYTHON_VERSION: '3.11'
   FIRMWARE_URL: ${{ github.event.inputs.firmware_url || 'https://archive.org/download/infinix-hot-10i-x-659-b-04/Infinix-Hot-10i-X659B-04.zip' }}
-  DEVICE_CODENAME: ${{ github.event.inputs.device_codename || 'x659b' }}
-  DEVICE_MANUFACTURER: ${{ github.event.inputs.device_manufacturer || 'infinix' }}
 
 jobs:
   build:
@@ -52,22 +42,7 @@ jobs:
             libncursesw5-dev xz-utils tk-dev libxml2-dev \
             libxmlsec1-dev libffi-dev liblzma-dev \
             python3-dev gcc g++ make \
-            erofs-utils sed
-
-      - name: Verify erofs-utils installation
-        run: |
-          which fsck.erofs || echo "fsck.erofs not found"
-          which dump.erofs || echo "dump.erofs not found"
-          
-          if ! command -v fsck.erofs &> /dev/null; then
-            echo "Downloading prebuilt erofs-utils..."
-            cd /tmp
-            curl -L -o erofs-utils.tar.gz "https://github.com/sekaiacg/erofs-utils/releases/download/v1.8.10-251217/erofs-utils-v1.8.10-251217-linux-x86_64.tar.gz"
-            tar -xzf erofs-utils.tar.gz
-            sudo cp erofs-utils/fsck.erofs /usr/local/bin/
-            sudo cp erofs-utils/dump.erofs /usr/local/bin/
-            sudo chmod +x /usr/local/bin/*.erofs
-          fi
+            erofs-utils
 
       - name: Install Python tools
         run: |
@@ -75,238 +50,170 @@ jobs:
           pip install dumpyara aospdtgen
           pip install backports.lzma protobuf pycryptodome extract-dtb
 
-      - name: Clone LineageOS extract-utils to correct location
+      - name: Create LineageOS directory structure and clone extract-utils
         run: |
-          echo "Creating LineageOS directory structure..."
-          mkdir -p $HOME/android/lineage/tools
+          # Create the EXACT directory structure that extract-files.py expects
+          # Shebang: PYTHONPATH=../../../tools/extract-utils
+          # Device tree will be at: ~/android/lineage/device/infinix/<codename>/
+          # So extract-utils must be at: ~/android/lineage/tools/extract-utils
           
-          echo "Cloning extract-utils to correct location..."
+          mkdir -p $HOME/android/lineage/tools
           cd $HOME/android/lineage/tools
+          
+          echo "Cloning LineageOS extract-utils..."
           git clone --depth=1 https://github.com/LineageOS/android_tools_extract-utils.git extract-utils
           
-          echo "Extract-utils cloned to:"
-          pwd
+          echo "Verifying extract-utils structure:"
           ls -la extract-utils/
-
-      - name: Create working directories
-        run: |
-          mkdir -p $HOME/dumpyara
-          mkdir -p $HOME/dumpyara/deviceTree
-          mkdir -p $HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
-          echo "WORK_DIR=$HOME/dumpyara" >> $GITHUB_ENV
-          echo "DEVICE_DIR=$HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}" >> $GITHUB_ENV
+          ls -la extract-utils/extract_utils/ 2>/dev/null || echo "extract_utils directory not found"
 
       - name: Download firmware
         run: |
+          mkdir -p $HOME/dumpyara
           cd $HOME/dumpyara
-          echo "Downloading firmware from ${{ env.FIRMWARE_URL }}..."
           
+          echo "Downloading firmware..."
           aria2c -x 16 -s 16 -k 1M -o firmware.zip "${{ env.FIRMWARE_URL }}" || \
           wget --progress=bar:force -O firmware.zip "${{ env.FIRMWARE_URL }}" || \
           curl -L -o firmware.zip "${{ env.FIRMWARE_URL }}"
           
-          if [ ! -f firmware.zip ]; then
-            echo "Error: Failed to download firmware"
-            exit 1
-          fi
-          
           ls -lh firmware.zip
-          file firmware.zip
 
       - name: Extract firmware with dumpyara
         run: |
           cd $HOME/dumpyara
-          echo "Extracting firmware with dumpyara..."
-          
           python3 -m dumpyara firmware.zip
           
-          if [ -d "$HOME/dumpyara/firmware" ]; then
-            DUMP_DIR="$HOME/dumpyara/firmware"
-            echo "Found firmware directory at $DUMP_DIR"
-          else
-            echo "ERROR: Could not find $HOME/dumpyara/firmware"
-            ls -la $HOME/dumpyara/
-            exit 1
-          fi
-          
-          echo "Firmware directory contents:"
-          ls -la "$DUMP_DIR"
-          
-          echo "DUMP_DIR=$DUMP_DIR" >> $GITHUB_ENV
+          echo "Firmware extracted to:"
+          ls -la $HOME/dumpyara/firmware/
 
       - name: Generate device tree with aospdtgen
         run: |
-          echo "Generating device tree with aospdtgen..."
-          echo "Using dump directory: $DUMP_DIR"
-          
-          if [ -z "$DUMP_DIR" ] || [ ! -d "$DUMP_DIR" ]; then
-            echo "Error: Dump directory not found"
-            exit 1
-          fi
-          
           cd $HOME/dumpyara
-          python3 -m aospdtgen "$DUMP_DIR" -o $HOME/dumpyara/deviceTree
+          python3 -m aospdtgen $HOME/dumpyara/firmware -o $HOME/dumpyara/deviceTree
           
-          # Find the generated device tree - aospdtgen uses firmware codename (e.g., FULL-64)
-          DT_DIR=$(find $HOME/dumpyara/deviceTree -maxdepth 1 -type d | grep -v "^$HOME/dumpyara/deviceTree$" | head -1)
-          
-          if [ -z "$DT_DIR" ] || [ ! -d "$DT_DIR" ]; then
-            DT_DIR="$HOME/dumpyara/deviceTree"
-          fi
-          
-          # Get the actual codename from the directory name
-          GENERATED_CODENAME=$(basename "$DT_DIR")
-          echo "Generated device tree codename: $GENERATED_CODENAME"
-          echo "User requested codename: ${{ env.DEVICE_CODENAME }}"
-          
-          # If different, we need to handle this
-          if [ "$GENERATED_CODENAME" != "${{ env.DEVICE_CODENAME }}" ]; then
-            echo "WARNING: Firmware codename ($GENERATED_CODENAME) differs from requested codename (${{ env.DEVICE_CODENAME }})"
-            echo "Will use firmware codename for device tree to ensure extract-files.py works"
-            echo "GENERATED_CODENAME=$GENERATED_CODENAME" >> $GITHUB_ENV
-          else
-            echo "GENERATED_CODENAME=${{ env.DEVICE_CODENAME }}" >> $GITHUB_ENV
-          fi
-          
-          echo "Device tree location: $DT_DIR"
-          echo "DT_DIR=$DT_DIR" >> $GITHUB_ENV
-          
-          if [ -d "$DT_DIR" ]; then
-            echo "Device tree contents:"
-            ls -laR "$DT_DIR" || true
-          fi
+          echo "Device tree generated at:"
+          ls -la $HOME/dumpyara/deviceTree/
 
-      - name: Prepare device tree structure
+      - name: Detect firmware codename and setup device tree
         run: |
-          echo "Preparing device tree for LineageOS..."
+          # aospdtgen uses codename from firmware build.prop (e.g., FULL-64)
+          # We need to detect it from the generated files
           
-          # Use the generated codename (from firmware) for the directory structure
-          # This ensures extract-files.py can find the files it expects
-          ACTUAL_CODENAME="${GENERATED_CODENAME:-${{ env.DEVICE_CODENAME }}}"
-          echo "Using codename: $ACTUAL_CODENAME"
+          DT_SRC=$HOME/dumpyara/deviceTree
           
-          mkdir -p $HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/$ACTUAL_CODENAME
-          
-          if [ -d "$DT_DIR" ]; then
-            cp -r "$DT_DIR"/* $HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/$ACTUAL_CODENAME/ 2>/dev/null || true
-            
-            echo "Files copied to device tree:"
-            ls -la $HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/$ACTUAL_CODENAME/ || true
-            
-            # Save the actual codename for later steps
-            echo "ACTUAL_CODENAME=$ACTUAL_CODENAME" >> $GITHUB_ENV
+          # Extract codename from extract-files.py namespace_imports
+          # Format: namespace_imports = ['device/infinix/FULL-64']
+          if [ -f "$DT_SRC/extract-files.py" ]; then
+            FIRMWARE_CODENAME=$(grep -oP "device/infinix/\K[^']+" "$DT_SRC/extract-files.py" | head -1)
           fi
+          
+          # Fallback: extract from AndroidProducts.mk
+          if [ -z "$FIRMWARE_CODENAME" ] && [ -f "$DT_SRC/AndroidProducts.mk" ]; then
+            FIRMWARE_CODENAME=$(grep -oP "PRODUCT_NAME := lineage_\K[^-]+" "$DT_SRC/AndroidProducts.mk" | head -1)
+          fi
+          
+          # Final fallback
+          if [ -z "$FIRMWARE_CODENAME" ]; then
+            FIRMWARE_CODENAME="FULL-64"
+          fi
+          
+          echo "Detected firmware codename: $FIRMWARE_CODENAME"
+          echo "FIRMWARE_CODENAME=$FIRMWARE_CODENAME" >> $GITHUB_ENV
+          
+          # Create device tree at the location extract-files.py expects
+          # namespace_imports = ['device/infinix/FULL-64']
+          mkdir -p $HOME/android/lineage/device/infinix/$FIRMWARE_CODENAME
+          
+          # Copy all generated files
+          cp -r $DT_SRC/* $HOME/android/lineage/device/infinix/$FIRMWARE_CODENAME/
+          
+          echo "Device tree created at:"
+          ls -la $HOME/android/lineage/device/infinix/$FIRMWARE_CODENAME/
 
-      - name: Run extract-files script
+      - name: Run extract-files.py
         run: |
-          ACTUAL_CODENAME="${ACTUAL_CODENAME:-${{ env.DEVICE_CODENAME }}}"
-          DEVICE_PATH=$HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/$ACTUAL_CODENAME
+          DEVICE_PATH=$HOME/android/lineage/device/infinix/$FIRMWARE_CODENAME
           
-          echo "Checking for extract scripts in $DEVICE_PATH..."
-          ls -la "$DEVICE_PATH/" 2>/dev/null || true
+          echo "Device tree location: $DEVICE_PATH"
+          echo "Contents:"
+          ls -la $DEVICE_PATH/
           
-          # Create vendor directory structure
-          mkdir -p $HOME/android/lineage/vendor/${{ env.DEVICE_MANUFACTURER }}/$ACTUAL_CODENAME
+          # Create vendor directory for extract-files.py output
+          mkdir -p $HOME/android/lineage/vendor/infinix/$FIRMWARE_CODENAME
           
-          if [ -f "$DEVICE_PATH/extract-files.sh" ]; then
-            echo "Found extract-files.sh (LineageOS 21 and below style)"
-            chmod +x "$DEVICE_PATH/extract-files.sh"
-            
-            cd "$DEVICE_PATH"
-            ./extract-files.sh "$DUMP_DIR" || echo "Extract files completed with warnings"
-            
-          elif [ -f "$DEVICE_PATH/extract-files.py" ]; then
-            echo "Found extract-files.py (LineageOS 22+ style)"
+          if [ -f "$DEVICE_PATH/extract-files.py" ]; then
+            echo "Running extract-files.py..."
             chmod +x "$DEVICE_PATH/extract-files.py"
             
-            cd "$DEVICE_PATH"
+            cd $DEVICE_PATH
             
-            echo "Running extract-files.py with built-in PYTHONPATH from shebang..."
-            ./extract-files.py "$DUMP_DIR" || {
-              echo "extract-files.py failed, trying with explicit PYTHONPATH..."
-              PYTHONPATH=$HOME/android/lineage/tools/extract-utils:$PYTHONPATH python3 extract-files.py "$DUMP_DIR" || \
-              echo "Extract files completed with warnings"
-            }
+            # The shebang sets PYTHONPATH=../../../tools/extract-utils
+            # which correctly resolves to ~/android/lineage/tools/extract-utils
+            ./extract-files.py $HOME/dumpyara/firmware
+            
+            echo "extract-files.py completed"
           else
-            echo "No extract-files script found"
+            echo "ERROR: extract-files.py not found!"
+            exit 1
           fi
 
-      - name: Rename device tree to requested codename (optional)
+      - name: Verify extraction results
         run: |
-          ACTUAL_CODENAME="${ACTUAL_CODENAME:-${{ env.DEVICE_CODENAME }}}"
+          echo "Checking vendor extraction results:"
+          ls -la $HOME/android/lineage/vendor/infinix/$FIRMWARE_CODENAME/ 2>/dev/null || echo "Vendor directory empty or not created"
           
-          # If the actual codename differs from requested, create a renamed copy
-          if [ "$ACTUAL_CODENAME" != "${{ env.DEVICE_CODENAME }}" ]; then
-            echo "Creating renamed copy from $ACTUAL_CODENAME to ${{ env.DEVICE_CODENAME }}..."
-            
-            cp -r $HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/$ACTUAL_CODENAME \
-                  $HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}_renamed
-            
-            # Update all references in the renamed copy
-            cd $HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}_renamed
-            
-            # Replace codename in files
-            find . -type f \( -name "*.py" -o -name "*.mk" -o -name "*.bp" -o -name "*.txt" \) -exec \
-              sed -i "s/$ACTUAL_CODENAME/${{ env.DEVICE_CODENAME }}/g" {} \; 2>/dev/null || true
-            
-            # Rename the renamed directory to final name
-            mv $HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}_renamed \
-               $HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
-            
-            echo "Renamed device tree created at:"
-            ls -la $HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/
-          fi
+          echo "Checking device tree:"
+          ls -la $HOME/android/lineage/device/infinix/$FIRMWARE_CODENAME/ 2>/dev/null || echo "Device tree not found"
 
       - name: Package outputs
         run: |
-          echo "Packaging outputs..."
-          
           cd $HOME/android/lineage
-          tar -czf ${{ github.workspace }}/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz device/ vendor/ 2>/dev/null || \
-          tar -czf ${{ github.workspace }}/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz device/ 2>/dev/null || \
-          tar -czf ${{ github.workspace }}/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz -C $HOME/dumpyara deviceTree/
           
+          # Package device tree and vendor files
+          tar -czf ${{ github.workspace }}/device-tree-$FIRMWARE_CODENAME.tar.gz device/ vendor/ 2>/dev/null || \
+          tar -czf ${{ github.workspace }}/device-tree-$FIRMWARE_CODENAME.tar.gz device/
+          
+          # Also package firmware dump for reference
           cd $HOME/dumpyara
-          tar -czf ${{ github.workspace }}/firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz firmware/ --exclude="firmware.zip" 2>/dev/null || true
+          tar -czf ${{ github.workspace }}/firmware-dump-$FIRMWARE_CODENAME.tar.gz firmware/ --exclude="firmware.zip" 2>/dev/null || true
           
-          ls -lh ${{ github.workspace }}/*.tar.gz 2>/dev/null || echo "Archives created"
+          ls -lh ${{ github.workspace }}/*.tar.gz
 
       - name: Upload device tree artifact
         uses: actions/upload-artifact@v4
         with:
-          name: device-tree-${{ env.DEVICE_CODENAME }}
-          path: ${{ github.workspace }}/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz
+          name: device-tree-${{ env.FIRMWARE_CODENAME }}
+          path: ${{ github.workspace }}/device-tree-*.tar.gz
           retention-days: 30
           if-no-files-found: warn
 
       - name: Upload firmware dump artifact
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-dump-${{ env.DEVICE_CODENAME }}
-          path: ${{ github.workspace }}/firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz
+          name: firmware-dump-${{ env.FIRMWARE_CODENAME }}
+          path: ${{ github.workspace }}/firmware-dump-*.tar.gz
           retention-days: 7
           if-no-files-found: ignore
 
       - name: Summary
         run: |
-          ACTUAL_CODENAME="${ACTUAL_CODENAME:-${{ env.DEVICE_CODENAME }}}"
-          
           echo "=========================================="
-          echo "Device Tree Generation Complete"
+          echo "DEVICE TREE GENERATION COMPLETE"
           echo "=========================================="
-          echo "Firmware codename: $ACTUAL_CODENAME"
-          echo "Requested codename: ${{ env.DEVICE_CODENAME }}"
-          echo "Dump directory: $DUMP_DIR"
+          echo "Firmware codename: $FIRMWARE_CODENAME"
           echo ""
-          echo "Generated device tree files:"
-          ls -la $HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/$ACTUAL_CODENAME/ || true
+          echo "Output location: ~/android/lineage/"
+          echo "  Device: device/infinix/$FIRMWARE_CODENAME/"
+          echo "  Vendor: vendor/infinix/$FIRMWARE_CODENAME/"
           echo ""
-          echo "Vendor files (if extracted):"
-          ls -la $HOME/android/lineage/vendor/${{ env.DEVICE_MANUFACTURER }}/$ACTUAL_CODENAME/ 2>/dev/null || echo "No vendor files extracted"
+          echo "Files generated:"
+          find $HOME/android/lineage/device/infinix/$FIRMWARE_CODENAME/ -type f -name "*.mk" -o -name "*.py" -o -name "*.txt" | head -10
           echo ""
-          if [ "$ACTUAL_CODENAME" != "${{ env.DEVICE_CODENAME }}" ]; then
-            echo "NOTE: Device tree was generated with firmware codename ($ACTUAL_CODENAME)"
-            echo "      A renamed copy with requested codename (${{ env.DEVICE_CODENAME }}) was also created"
-          fi
+          echo "To use this device tree:"
+          echo "1. Extract the artifact in your LineageOS source tree"
+          echo "2. cd device/infinix/$FIRMWARE_CODENAME"
+          echo "3. source build/envsetup.sh"
+          echo "4. lunch lineage_$FIRMWARE_CODENAME-userdebug"
           echo "=========================================="
           
