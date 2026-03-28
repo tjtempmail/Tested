@@ -38,7 +38,10 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          # Enable universe repository which contains erofs-utils
+          sudo add-apt-repository universe -y
           sudo apt-get update
+          
           sudo apt-get install -y \
             unace unrar zip unzip p7zip-full p7zip-rar \
             sharutils rar uudeview mpack arj cabextract \
@@ -50,7 +53,28 @@ jobs:
             libbz2-dev libreadline-dev libsqlite3-dev \
             libncursesw5-dev xz-utils tk-dev libxml2-dev \
             libxmlsec1-dev libffi-dev liblzma-dev \
-            python3-dev gcc g++ make
+            python3-dev gcc g++ make \
+            erofs-utils
+
+      - name: Verify erofs-utils installation
+        run: |
+          which fsck.erofs || echo "fsck.erofs not found"
+          which dump.erofs || echo "dump.erofs not found"
+          dpkg -l | grep erofs || echo "erofs-utils not installed via dpkg"
+          
+          # If not found, download prebuilt binaries
+          if ! command -v fsck.erofs &> /dev/null; then
+            echo "Downloading prebuilt erofs-utils..."
+            cd /tmp
+            curl -L -o erofs-utils.tar.gz "https://github.com/sekaiacg/erofs-utils/releases/download/v1.8.10-251217/erofs-utils-v1.8.10-251217-linux-x86_64.tar.gz"
+            tar -xzf erofs-utils.tar.gz
+            sudo cp erofs-utils/fsck.erofs /usr/local/bin/
+            sudo cp erofs-utils/dump.erofs /usr/local/bin/
+            sudo cp erofs-utils/mkfs.erofs /usr/local/bin/
+            sudo chmod +x /usr/local/bin/*.erofs
+          fi
+          
+          fsck.erofs --version || true
 
       - name: Install Python tools
         run: |
