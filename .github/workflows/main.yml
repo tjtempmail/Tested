@@ -49,15 +49,16 @@ jobs:
             android-sdk-libsparse-utils \
             libbz2-dev libreadline-dev libsqlite3-dev \
             libncursesw5-dev xz-utils tk-dev libxml2-dev \
-            libxmlsec1-dev libffi-dev liblzma-dev
+            libxmlsec1-dev libffi-dev liblzma-dev \
+            python3-dev gcc g++ make
 
       - name: Install Python tools
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip wheel setuptools
+          # Install dumpyara and aospdtgen - these will pull their dependencies
           pip install dumpyara aospdtgen
-          # Install additional dependencies that might be needed
-          pip install backports.lzma protobuf pycryptodome \
-            extract-dtb twrpdtgen pycrypto
+          # Install additional compatible dependencies (NO pycrypto!)
+          pip install backports.lzma protobuf pycryptodome extract-dtb
 
       - name: Create working directories
         run: |
@@ -220,33 +221,6 @@ jobs:
           path: ~/firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz
           retention-days: 14
           if-no-files-found: ignore
-
-      - name: Create release with outputs
-        if: github.event_name == 'workflow_dispatch'
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ env.DEVICE_CODENAME }}-${{ github.run_number }}
-          name: "Device Tree ${{ env.DEVICE_CODENAME }} - Build ${{ github.run_number }}"
-          body: |
-            Automated device tree generation for ${{ env.DEVICE_MANUFACTURER }} ${{ env.DEVICE_CODENAME }}
-            
-            **Source Firmware:** ${{ env.FIRMWARE_URL }}
-            
-            **Generated using:**
-            - dumpyara (Python firmware extractor) [^7^]
-            - aospdtgen (LineageOS device tree generator) [^8^]
-            
-            **Contents:**
-            - Device tree for LineageOS
-            - Vendor blobs (if extraction succeeded)
-            - Original firmware dump for reference
-            
-            **Note:** This is an automated generation. Manual review and fixes may be required before building.
-          files: |
-            ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz
-            ~/firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Summary
         run: |
