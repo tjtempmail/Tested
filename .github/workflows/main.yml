@@ -1,85 +1,269 @@
-name: Download Windows ISO with aria2
+name: Generate Infinix X659B Device Tree
 
 on:
   workflow_dispatch:
     inputs:
-      max_concurrent_downloads:
-        description: 'Maximum number of concurrent downloads'
+      firmware_url:
+        description: 'Direct URL to firmware ZIP (or use default archive.org link)'
         required: false
-        default: '4'
-        type: string
-      max_connection_per_server:
-        description: 'Maximum connections per server'
+        default: 'https://archive.org/download/infinix-hot-10i-x-659-b-04/Infinix-Hot-10i-X659B-04.zip'
+      device_codename:
+        description: 'Device codename'
         required: false
-        default: '8'
-        type: string
+        default: 'x659b'
+      device_manufacturer:
+        description: 'Device manufacturer'
+        required: false
+        default: 'infinix'
+
+env:
+  PYTHON_VERSION: '3.11'
+  FIRMWARE_URL: ${{ github.event.inputs.firmware_url || 'https://archive.org/download/infinix-hot-10i-x-659-b-04/Infinix-Hot-10i-X659B-04.zip' }}
+  DEVICE_CODENAME: ${{ github.event.inputs.device_codename || 'x659b' }}
+  DEVICE_MANUFACTURER: ${{ github.event.inputs.device_manufacturer || 'infinix' }}
 
 jobs:
-  download:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
     
     steps:
-      - name: Fix DNS and install aria2
-        run: |
-          # Fix DNS issues by using Google/Cloudflare DNS
-          sudo rm -f /etc/resolv.conf
-          echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
-          echo "nameserver 8.8.4.4" | sudo tee -a /etc/resolv.conf
-          echo "nameserver 1.1.1.1" | sudo tee -a /etc/resolv.conf
-          
-          # Disable systemd-resolved to prevent it from overwriting
-          sudo systemctl stop systemd-resolved || true
-          
-          # Install aria2
-          sudo apt-get update
-          sudo apt-get install -y aria2 dnsutils
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Test DNS resolution
-        run: |
-          echo "Testing DNS resolution..."
-          dig drive.massgrave.dev +short || echo "dig failed"
-          nslookup drive.massgrave.dev || echo "nslookup failed"
-          host drive.massgrave.dev || echo "host failed"
-
-      - name: Create download directory
-        run: mkdir -p downloads
-
-      - name: Download ISO with aria2 (with DNS fix)
-        working-directory: downloads
-        timeout-minutes: 360  # 6 hours max
-        run: |
-          # Try with async-dns disabled to use system DNS
-          aria2c \
-            --async-dns=false \
-            --max-concurrent-downloads=${{ github.event.inputs.max_concurrent_downloads || '4' }} \
-            --max-connection-per-server=${{ github.event.inputs.max_connection_per_server || '8' }} \
-            --min-split-size=1M \
-            --split=16 \
-            --continue=true \
-            --retry-wait=5 \
-            --max-tries=10 \
-            --timeout=60 \
-            --console-log-level=warn \
-            --summary-interval=30 \
-            --disk-cache=64M \
-            --file-allocation=falloc \
-            --remote-time=true \
-            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            --check-certificate=false \
-            "https://drive.massgrave.dev/en-us_windows_10_iot_enterprise_ltsc_2021_x64_dvd_257ad90f.iso"
-
-      - name: Verify download
-        working-directory: downloads
-        run: |
-          ls -lh *.iso || echo "No ISO found"
-          find . -type f -name "*.iso" -exec sha256sum {} \;
-
-      - name: Upload ISO as artifact
-        uses: actions/upload-artifact@v4
-        if: success()
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          name: windows-10-iot-ltsc-2021
-          path: downloads/*.iso
-          retention-days: 1
-          compression-level: 0  # No compression for binary files
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            unace unrar zip unzip p7zip-full p7zip-rar \
+            sharutils rar uudeview mpack arj cabextract \
+            rename liblzma-dev brotli lz4 protobuf-compiler \
+            git gawk cpio aria2 curl wget \
+            libmagic1 libxml2-utils \
+            device-tree-compiler \
+            android-sdk-libsparse-utils \
+            libbz2-dev libreadline-dev libsqlite3-dev \
+            libncursesw5-dev xz-utils tk-dev libxml2-dev \
+            libxmlsec1-dev libffi-dev liblzma-dev
+
+      - name: Install Python tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install dumpyara aospdtgen
+          # Install additional dependencies that might be needed
+          pip install backports.lzma protobuf pycryptodome \
+            extract-dtb twrpdtgen pycrypto
+
+      - name: Create working directories
+        run: |
+          mkdir -p ~/dumpyara
+          mkdir -p ~/dumpyara/deviceTree
+          mkdir -p ~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
+          echo "WORK_DIR=$HOME/dumpyara" >> $GITHUB_ENV
+          echo "DEVICE_DIR=$HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}" >> $GITHUB_ENV
+
+      - name: Download firmware
+        run: |
+          cd ~/dumpyara
+          echo "Downloading firmware from ${{ env.FIRMWARE_URL }}..."
+          
+          # Use aria2c for faster/reliable download with resume capability
+          aria2c -x 16 -s 16 -k 1M -o firmware.zip "${{ env.FIRMWARE_URL }}" || \
+          wget --progress=bar:force -O firmware.zip "${{ env.FIRMWARE_URL }}" || \
+          curl -L -o firmware.zip "${{ env.FIRMWARE_URL }}"
+          
+          # Verify download
+          if [ ! -f firmware.zip ]; then
+            echo "Error: Failed to download firmware"
+            exit 1
+          fi
+          
+          ls -lh firmware.zip
+          file firmware.zip
+
+      - name: Extract firmware with dumpyara
+        run: |
+          cd ~/dumpyara
+          echo "Extracting firmware with dumpyara..."
+          
+          # Run dumpyara Python module
+          python3 -m dumpyara firmware.zip
+          
+          # Find the working directory created by dumpyara
+          DUMP_DIR=$(find ~/dumpyara -maxdepth 2 -type d -name "*Infinix*" -o -name "*X659B*" -o -name "*firmware*" | head -1)
+          
+          if [ -z "$DUMP_DIR" ]; then
+            # List contents to debug
+            ls -la ~/dumpyara/
+            echo "Trying to find any extracted directory..."
+            DUMP_DIR=$(find ~/dumpyara -maxdepth 3 -type d | grep -v "^/home/runner/dumpyara$" | head -2 | tail -1)
+          fi
+          
+          echo "Found dump directory: $DUMP_DIR"
+          echo "DUMP_DIR=$DUMP_DIR" >> $GITHUB_ENV
+          
+          # List contents for verification
+          ls -la "$DUMP_DIR" || true
+
+      - name: Generate device tree with aospdtgen
+        run: |
+          cd ~/dumpyara
+          echo "Generating device tree with aospdtgen..."
+          
+          if [ -z "$DUMP_DIR" ] || [ ! -d "$DUMP_DIR" ]; then
+            echo "Error: Dump directory not found"
+            exit 1
+          fi
+          
+          # Run aospdtgen
+          python3 -m aospdtgen "$DUMP_DIR" -o ~/dumpyara/deviceTree
+          
+          # Find generated device tree
+          DT_DIR=$(find ~/dumpyara/deviceTree -maxdepth 3 -type d -name "${{ env.DEVICE_CODENAME }}" | head -1)
+          
+          if [ -z "$DT_DIR" ]; then
+            echo "Searching for any generated device tree..."
+            DT_DIR=$(find ~/dumpyara/deviceTree -maxdepth 4 -type d | grep -E "(device|${{ env.DEVICE_CODENAME }})" | head -1)
+          fi
+          
+          echo "Device tree location: $DT_DIR"
+          echo "DT_DIR=$DT_DIR" >> $GITHUB_ENV
+          
+          if [ -d "$DT_DIR" ]; then
+            ls -laR "$DT_DIR"
+          fi
+
+      - name: Prepare device tree structure
+        run: |
+          echo "Preparing device tree for LineageOS..."
+          
+          # Create device directory structure
+          mkdir -p ~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
+          
+          if [ -d "$DT_DIR" ]; then
+            # Copy generated device tree to proper location
+            cp -r "$DT_DIR"/* ~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/ || true
+            
+            # If DT_DIR is empty or copy failed, try alternative paths
+            if [ ! -f ~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/Android.bp ]; then
+              # Look for any Android.bp or Android.mk files
+              find ~/dumpyara/deviceTree -name "Android.bp" -o -name "Android.mk" | head -5
+              
+              # Copy everything from deviceTree if specific structure not found
+              cp -r ~/dumpyara/deviceTree/* ~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/ || true
+            fi
+          fi
+          
+          # List final structure
+          ls -laR ~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/ || true
+
+      - name: Run extract-files script (if available)
+        run: |
+          DEVICE_PATH=~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
+          
+          # Check if extract-files.py or extract-files.sh exists
+          if [ -f "$DEVICE_PATH/extract-files.py" ]; then
+            echo "Found extract-files.py, running it..."
+            chmod +x "$DEVICE_PATH/extract-files.py"
+            
+            # Create vendor directory structure
+            mkdir -p ~/android/lineage/vendor/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
+            
+            # Run extract script pointing to dumpyara output
+            cd "$DEVICE_PATH"
+            python3 extract-files.py "$DUMP_DIR" || echo "Extract files script completed with warnings"
+            
+          elif [ -f "$DEVICE_PATH/extract-files.sh" ]; then
+            echo "Found extract-files.sh, running it..."
+            chmod +x "$DEVICE_PATH/extract-files.sh"
+            
+            cd "$DEVICE_PATH"
+            ./extract-files.sh "$DUMP_DIR" || echo "Extract files script completed with warnings"
+          else
+            echo "No extract-files script found in device tree"
+            echo "Available files in device tree:"
+            find "$DEVICE_PATH" -type f | head -20
+          fi
+
+      - name: Package outputs
+        run: |
+          echo "Packaging generated device tree and vendor files..."
+          
+          # Create output archive
+          cd ~/android/lineage
+          tar -czf ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz device/ vendor/ || \
+          tar -czf ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz device/ || \
+          tar -czf ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz -C ~/dumpyara deviceTree/
+          
+          # Also create a zip of the raw dumpyara output for reference
+          cd ~/dumpyara
+          tar -czf ~/firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz working/ --exclude="firmware.zip" || true
+          
+          ls -lh ~/*.tar.gz
+
+      - name: Upload device tree artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-tree-${{ env.DEVICE_CODENAME }}
+          path: ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz
+          retention-days: 30
+
+      - name: Upload firmware dump artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-dump-${{ env.DEVICE_CODENAME }}
+          path: ~/firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Create release with outputs
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.DEVICE_CODENAME }}-${{ github.run_number }}
+          name: "Device Tree ${{ env.DEVICE_CODENAME }} - Build ${{ github.run_number }}"
+          body: |
+            Automated device tree generation for ${{ env.DEVICE_MANUFACTURER }} ${{ env.DEVICE_CODENAME }}
+            
+            **Source Firmware:** ${{ env.FIRMWARE_URL }}
+            
+            **Generated using:**
+            - dumpyara (Python firmware extractor) [^7^]
+            - aospdtgen (LineageOS device tree generator) [^8^]
+            
+            **Contents:**
+            - Device tree for LineageOS
+            - Vendor blobs (if extraction succeeded)
+            - Original firmware dump for reference
+            
+            **Note:** This is an automated generation. Manual review and fixes may be required before building.
+          files: |
+            ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz
+            ~/firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          echo "=========================================="
+          echo "Device Tree Generation Complete"
+          echo "=========================================="
+          echo "Device: ${{ env.DEVICE_MANUFACTURER }} ${{ env.DEVICE_CODENAME }}"
+          echo "Firmware: ${{ env.FIRMWARE_URL }}"
+          echo ""
+          echo "Artifacts uploaded:"
+          echo "- device-tree-${{ env.DEVICE_CODENAME }}.tar.gz"
+          echo "- firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz (if available)"
+          echo ""
+          echo "Next steps:"
+          echo "1. Download and extract the device tree artifact"
+          echo "2. Review the generated files in device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/"
+          echo "3. Check vendor/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/ for proprietary files"
+          echo "4. Manual fixes may be needed for BoardConfig.mk, device.mk, and AndroidProducts.mk"
+          echo "=========================================="
           
