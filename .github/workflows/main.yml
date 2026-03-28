@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       firmware_url:
-        description: 'Direct URL to firmware ZIP (or use default archive.org link)'
+        description: 'Direct URL to firmware ZIP'
         required: false
         default: 'https://archive.org/download/infinix-hot-10i-x-659-b-04/Infinix-Hot-10i-X659B-04.zip'
       device_codename:
@@ -38,10 +38,8 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          # Enable universe repository which contains erofs-utils
           sudo add-apt-repository universe -y
           sudo apt-get update
-          
           sudo apt-get install -y \
             unace unrar zip unzip p7zip-full p7zip-rar \
             sharutils rar uudeview mpack arj cabextract \
@@ -60,9 +58,7 @@ jobs:
         run: |
           which fsck.erofs || echo "fsck.erofs not found"
           which dump.erofs || echo "dump.erofs not found"
-          dpkg -l | grep erofs || echo "erofs-utils not installed via dpkg"
           
-          # If not found, download prebuilt binaries
           if ! command -v fsck.erofs &> /dev/null; then
             echo "Downloading prebuilt erofs-utils..."
             cd /tmp
@@ -70,18 +66,13 @@ jobs:
             tar -xzf erofs-utils.tar.gz
             sudo cp erofs-utils/fsck.erofs /usr/local/bin/
             sudo cp erofs-utils/dump.erofs /usr/local/bin/
-            sudo cp erofs-utils/mkfs.erofs /usr/local/bin/
             sudo chmod +x /usr/local/bin/*.erofs
           fi
-          
-          fsck.erofs --version || true
 
       - name: Install Python tools
         run: |
           python -m pip install --upgrade pip wheel setuptools
-          # Install dumpyara and aospdtgen - these will pull their dependencies
           pip install dumpyara aospdtgen
-          # Install additional compatible dependencies (NO pycrypto!)
           pip install backports.lzma protobuf pycryptodome extract-dtb
 
       - name: Create working directories
@@ -97,12 +88,10 @@ jobs:
           cd ~/dumpyara
           echo "Downloading firmware from ${{ env.FIRMWARE_URL }}..."
           
-          # Use aria2c for faster/reliable download with resume capability
           aria2c -x 16 -s 16 -k 1M -o firmware.zip "${{ env.FIRMWARE_URL }}" || \
           wget --progress=bar:force -O firmware.zip "${{ env.FIRMWARE_URL }}" || \
           curl -L -o firmware.zip "${{ env.FIRMWARE_URL }}"
           
-          # Verify download
           if [ ! -f firmware.zip ]; then
             echo "Error: Failed to download firmware"
             exit 1
@@ -116,23 +105,19 @@ jobs:
           cd ~/dumpyara
           echo "Extracting firmware with dumpyara..."
           
-          # Run dumpyara Python module
           python3 -m dumpyara firmware.zip
           
           # Find the working directory created by dumpyara
-          DUMP_DIR=$(find ~/dumpyara -maxdepth 2 -type d -name "*Infinix*" -o -name "*X659B*" -o -name "*firmware*" | head -1)
+          DUMP_DIR=$(find ~/dumpyara -maxdepth 2 -type d -name "*Infinix*" -o -name "*X659B*" -o -name "*working*" | head -1)
           
           if [ -z "$DUMP_DIR" ]; then
-            # List contents to debug
             ls -la ~/dumpyara/
-            echo "Trying to find any extracted directory..."
             DUMP_DIR=$(find ~/dumpyara -maxdepth 3 -type d | grep -v "^/home/runner/dumpyara$" | head -2 | tail -1)
           fi
           
           echo "Found dump directory: $DUMP_DIR"
           echo "DUMP_DIR=$DUMP_DIR" >> $GITHUB_ENV
           
-          # List contents for verification
           ls -la "$DUMP_DIR" || true
 
       - name: Generate device tree with aospdtgen
@@ -145,14 +130,13 @@ jobs:
             exit 1
           fi
           
-          # Run aospdtgen
+          # Run aospdtgen (generates extract-files.sh by default)
           python3 -m aospdtgen "$DUMP_DIR" -o ~/dumpyara/deviceTree
           
           # Find generated device tree
           DT_DIR=$(find ~/dumpyara/deviceTree -maxdepth 3 -type d -name "${{ env.DEVICE_CODENAME }}" | head -1)
           
           if [ -z "$DT_DIR" ]; then
-            echo "Searching for any generated device tree..."
             DT_DIR=$(find ~/dumpyara/deviceTree -maxdepth 4 -type d | grep -E "(device|${{ env.DEVICE_CODENAME }})" | head -1)
           fi
           
@@ -167,51 +151,45 @@ jobs:
         run: |
           echo "Preparing device tree for LineageOS..."
           
-          # Create device directory structure
           mkdir -p ~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
           
           if [ -d "$DT_DIR" ]; then
-            # Copy generated device tree to proper location
             cp -r "$DT_DIR"/* ~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/ || true
             
-            # If DT_DIR is empty or copy failed, try alternative paths
-            if [ ! -f ~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/Android.bp ]; then
-              # Look for any Android.bp or Android.mk files
-              find ~/dumpyara/deviceTree -name "Android.bp" -o -name "Android.mk" | head -5
-              
-              # Copy everything from deviceTree if specific structure not found
-              cp -r ~/dumpyara/deviceTree/* ~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/ || true
-            fi
+            # Check what files were generated
+            echo "Generated files in device tree:"
+            ls -la ~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/
           fi
-          
-          # List final structure
-          ls -laR ~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/ || true
 
-      - name: Run extract-files script (if available)
+      - name: Run extract-files script
         run: |
           DEVICE_PATH=~/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
           
-          # Check if extract-files.py or extract-files.sh exists
-          if [ -f "$DEVICE_PATH/extract-files.py" ]; then
-            echo "Found extract-files.py, running it..."
-            chmod +x "$DEVICE_PATH/extract-files.py"
+          echo "Checking for extract scripts in $DEVICE_PATH..."
+          ls -la "$DEVICE_PATH/" || true
+          
+          # CRITICAL FIX: Check for BOTH .sh and .py versions
+          if [ -f "$DEVICE_PATH/extract-files.sh" ]; then
+            echo "Found extract-files.sh (aospdtgen default for LineageOS 21 and below)"
+            chmod +x "$DEVICE_PATH/extract-files.sh"
             
             # Create vendor directory structure
             mkdir -p ~/android/lineage/vendor/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
             
-            # Run extract script pointing to dumpyara output
             cd "$DEVICE_PATH"
-            python3 extract-files.py "$DUMP_DIR" || echo "Extract files script completed with warnings"
+            ./extract-files.sh "$DUMP_DIR" || echo "Extract files completed with warnings"
             
-          elif [ -f "$DEVICE_PATH/extract-files.sh" ]; then
-            echo "Found extract-files.sh, running it..."
-            chmod +x "$DEVICE_PATH/extract-files.sh"
+          elif [ -f "$DEVICE_PATH/extract-files.py" ]; then
+            echo "Found extract-files.py (LineageOS 22+ style)"
+            chmod +x "$DEVICE_PATH/extract-files.py"
+            
+            mkdir -p ~/android/lineage/vendor/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
             
             cd "$DEVICE_PATH"
-            ./extract-files.sh "$DUMP_DIR" || echo "Extract files script completed with warnings"
+            python3 extract-files.py "$DUMP_DIR" || echo "Extract files completed with warnings"
           else
-            echo "No extract-files script found in device tree"
-            echo "Available files in device tree:"
+            echo "WARNING: No extract-files script found!"
+            echo "Files in device tree:"
             find "$DEVICE_PATH" -type f | head -20
           fi
 
@@ -219,13 +197,11 @@ jobs:
         run: |
           echo "Packaging generated device tree and vendor files..."
           
-          # Create output archive
           cd ~/android/lineage
           tar -czf ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz device/ vendor/ || \
           tar -czf ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz device/ || \
           tar -czf ~/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz -C ~/dumpyara deviceTree/
           
-          # Also create a zip of the raw dumpyara output for reference
           cd ~/dumpyara
           tar -czf ~/firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz working/ --exclude="firmware.zip" || true
           
@@ -252,16 +228,16 @@ jobs:
           echo "Device Tree Generation Complete"
           echo "=========================================="
           echo "Device: ${{ env.DEVICE_MANUFACTURER }} ${{ env.DEVICE_CODENAME }}"
-          echo "Firmware: ${{ env.FIRMWARE_URL }}"
           echo ""
-          echo "Artifacts uploaded:"
-          echo "- device-tree-${{ env.DEVICE_CODENAME }}.tar.gz"
-          echo "- firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz (if available)"
+          echo "Generated files should include:"
+          echo "- extract-files.sh (shell script for LineageOS 21 and below)"
+          echo "- setup-makefiles.sh"
+          echo "- proprietary-files.txt"
+          echo "- BoardConfig.mk"
+          echo "- device.mk"
+          echo "- Android.mk"
           echo ""
-          echo "Next steps:"
-          echo "1. Download and extract the device tree artifact"
-          echo "2. Review the generated files in device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/"
-          echo "3. Check vendor/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/ for proprietary files"
-          echo "4. Manual fixes may be needed for BoardConfig.mk, device.mk, and AndroidProducts.mk"
+          echo "NOTE: aospdtgen generates SHELL scripts (.sh), not Python (.py)"
+          echo "For LineageOS 22+, you need to manually convert to Python templates"
           echo "=========================================="
           
