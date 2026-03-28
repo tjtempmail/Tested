@@ -107,28 +107,18 @@ jobs:
           
           python3 -m dumpyara firmware.zip
           
-          # CRITICAL FIX: Use $HOME instead of ~ and check without quotes for tilde expansion
-          # dumpyara outputs to $HOME/dumpyara/firmware by default
+          # Use the firmware directory created by dumpyara
           if [ -d "$HOME/dumpyara/firmware" ]; then
             DUMP_DIR="$HOME/dumpyara/firmware"
             echo "Found firmware directory at $DUMP_DIR"
           else
             echo "ERROR: Could not find $HOME/dumpyara/firmware"
-            echo "Contents of $HOME/dumpyara:"
             ls -la $HOME/dumpyara/
             exit 1
           fi
           
-          # Verify the directory has expected contents
           echo "Firmware directory contents:"
           ls -la "$DUMP_DIR"
-          
-          # Check for key partitions
-          if [ -d "$DUMP_DIR/system" ] || [ -d "$DUMP_DIR/product" ] || [ -d "$DUMP_DIR/vendor" ]; then
-            echo "Found valid firmware partitions"
-          else
-            echo "WARNING: No standard partitions found in $DUMP_DIR"
-          fi
           
           echo "DUMP_DIR=$DUMP_DIR" >> $GITHUB_ENV
 
@@ -142,11 +132,6 @@ jobs:
             exit 1
           fi
           
-          # Verify the dump has required partitions
-          echo "Checking for partitions in $DUMP_DIR:"
-          ls -la "$DUMP_DIR" || true
-          
-          # Run aospdtgen
           cd $HOME/dumpyara
           python3 -m aospdtgen "$DUMP_DIR" -o $HOME/dumpyara/deviceTree
           
@@ -154,7 +139,6 @@ jobs:
           DT_DIR=$(find $HOME/dumpyara/deviceTree -maxdepth 3 -type d -name "${{ env.DEVICE_CODENAME }}" 2>/dev/null | head -1)
           
           if [ -z "$DT_DIR" ]; then
-            # Maybe it's directly in deviceTree/
             if [ -f "$HOME/dumpyara/deviceTree/Android.bp" ] || [ -f "$HOME/dumpyara/deviceTree/Android.mk" ]; then
               DT_DIR="$HOME/dumpyara/deviceTree"
             else
@@ -164,8 +148,6 @@ jobs:
           
           if [ -z "$DT_DIR" ] || [ ! -d "$DT_DIR" ]; then
             echo "Warning: Could not find generated device tree"
-            echo "Contents of $HOME/dumpyara/deviceTree:"
-            ls -laR $HOME/dumpyara/deviceTree/ || true
             DT_DIR="$HOME/dumpyara/deviceTree"
           fi
           
@@ -188,60 +170,71 @@ jobs:
             
             echo "Files copied to device tree:"
             ls -la $HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/ || true
-          else
-            echo "Warning: Device tree directory not found at $DT_DIR"
           fi
 
-      - name: Run extract-files script
+      - name: Check extract scripts (informational only)
         run: |
           DEVICE_PATH=$HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
           
           echo "Checking for extract scripts in $DEVICE_PATH..."
           ls -la "$DEVICE_PATH/" 2>/dev/null || true
           
-          # aospdtgen generates extract-files.sh (shell) by default
           if [ -f "$DEVICE_PATH/extract-files.sh" ]; then
-            echo "Found extract-files.sh (aospdtgen default)"
-            chmod +x "$DEVICE_PATH/extract-files.sh"
-            
-            mkdir -p $HOME/android/lineage/vendor/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
-            
-            cd "$DEVICE_PATH"
-            ./extract-files.sh "$DUMP_DIR" || echo "Extract files completed with warnings"
-            
+            echo "Found extract-files.sh (LineageOS 21 and below style)"
+            echo "Note: This script requires the full LineageOS source tree to run"
           elif [ -f "$DEVICE_PATH/extract-files.py" ]; then
             echo "Found extract-files.py (LineageOS 22+ style)"
-            chmod +x "$DEVICE_PATH/extract-files.py"
-            
-            mkdir -p $HOME/android/lineage/vendor/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
-            
-            cd "$DEVICE_PATH"
-            python3 extract-files.py "$DUMP_DIR" || echo "Extract files completed with warnings"
+            echo "Note: This script requires the full LineageOS source tree and extract-utils to run"
+            echo "The extract_utils module is not available in CI - run this script locally after cloning LineageOS"
           else
-            echo "WARNING: No extract-files script found!"
-            echo "Files in device tree:"
-            find "$DEVICE_PATH" -type f 2>/dev/null | head -20 || true
+            echo "No extract-files script found"
           fi
+          
+          # Create a README with instructions
+          cat > $HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/README_EXTRACT.md << 'EOF'
+          # Extracting Proprietary Files
+          
+          ## Option 1: From Firmware Dump (Local)
+          After cloning the LineageOS source tree, run:
+          ```bash
+          cd device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
+          ./extract-files.py /path/to/firmware/dump
+          # or for older LineageOS versions:
+          ./extract-files.sh /path/to/firmware/dump
+          ```
+          
+          ## Option 2: From Device (ADB)
+          Connect your device with USB debugging enabled:
+          ```bash
+          cd device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}
+          ./extract-files.sh
+          ```
+          
+          ## Note
+          The extract-files scripts require the full LineageOS source tree and build environment.
+          They cannot be run in CI because they depend on LineageOS-specific tools (extract_utils).
+          EOF
 
       - name: Package outputs
         run: |
           echo "Packaging outputs..."
           
+          # Create device tree archive in workspace for artifact upload
           cd $HOME/android/lineage
-          tar -czf $HOME/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz device/ vendor/ 2>/dev/null || \
-          tar -czf $HOME/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz device/ 2>/dev/null || \
-          tar -czf $HOME/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz -C $HOME/dumpyara deviceTree/
+          tar -czf ${{ github.workspace }}/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz device/ 2>/dev/null || \
+          tar -czf ${{ github.workspace }}/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz -C $HOME/dumpyara deviceTree/
           
+          # Create firmware dump archive (optional, very large)
           cd $HOME/dumpyara
-          tar -czf $HOME/firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz firmware/ --exclude="firmware.zip" 2>/dev/null || true
+          tar -czf ${{ github.workspace }}/firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz firmware/ --exclude="firmware.zip" 2>/dev/null || true
           
-          ls -lh $HOME/*.tar.gz 2>/dev/null || echo "No archives created"
+          ls -lh ${{ github.workspace }}/*.tar.gz 2>/dev/null || echo "Archives created"
 
       - name: Upload device tree artifact
         uses: actions/upload-artifact@v4
         with:
           name: device-tree-${{ env.DEVICE_CODENAME }}
-          path: ${{ github.workspace }}/../../device-tree-${{ env.DEVICE_CODENAME }}.tar.gz
+          path: ${{ github.workspace }}/device-tree-${{ env.DEVICE_CODENAME }}.tar.gz
           retention-days: 30
           if-no-files-found: warn
 
@@ -249,8 +242,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: firmware-dump-${{ env.DEVICE_CODENAME }}
-          path: ${{ github.workspace }}/../../firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz
-          retention-days: 14
+          path: ${{ github.workspace }}/firmware-dump-${{ env.DEVICE_CODENAME }}.tar.gz
+          retention-days: 7
           if-no-files-found: ignore
 
       - name: Summary
@@ -261,11 +254,15 @@ jobs:
           echo "Device: ${{ env.DEVICE_MANUFACTURER }} ${{ env.DEVICE_CODENAME }}"
           echo "Dump directory: $DUMP_DIR"
           echo ""
-          echo "Generated files should include:"
-          echo "- extract-files.sh (shell script)"
-          echo "- setup-makefiles.sh"
-          echo "- proprietary-files.txt"
-          echo "- BoardConfig.mk"
-          echo "- device.mk"
+          echo "Generated files:"
+          ls -la $HOME/android/lineage/device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}/ || true
+          echo ""
+          echo "IMPORTANT NOTES:"
+          echo "1. The extract-files.py script requires LineageOS extract-utils"
+          echo "2. Run extract-files locally after cloning LineageOS source:"
+          echo "   repo init -u https://github.com/LineageOS/android.git -b lineage-22.1"
+          echo "   repo sync"
+          echo "   cd device/${{ env.DEVICE_MANUFACTURER }}/${{ env.DEVICE_CODENAME }}"
+          echo "   ./extract-files.py $DUMP_DIR"
           echo "=========================================="
           
