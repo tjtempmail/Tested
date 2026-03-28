@@ -1,7 +1,7 @@
 name: Download Windows ISO with aria2
 
 on:
-  workflow_dispatch:  # Manual trigger only
+  workflow_dispatch:
     inputs:
       max_concurrent_downloads:
         description: 'Maximum number of concurrent downloads'
@@ -19,44 +19,67 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Install aria2
+      - name: Fix DNS and install aria2
         run: |
+          # Fix DNS issues by using Google/Cloudflare DNS
+          sudo rm -f /etc/resolv.conf
+          echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
+          echo "nameserver 8.8.4.4" | sudo tee -a /etc/resolv.conf
+          echo "nameserver 1.1.1.1" | sudo tee -a /etc/resolv.conf
+          
+          # Disable systemd-resolved to prevent it from overwriting
+          sudo systemctl stop systemd-resolved || true
+          
+          # Install aria2
           sudo apt-get update
-          sudo apt-get install -y aria2
+          sudo apt-get install -y aria2 dnsutils
+
+      - name: Test DNS resolution
+        run: |
+          echo "Testing DNS resolution..."
+          dig drive.massgrave.dev +short || echo "dig failed"
+          nslookup drive.massgrave.dev || echo "nslookup failed"
+          host drive.massgrave.dev || echo "host failed"
 
       - name: Create download directory
         run: mkdir -p downloads
 
-      - name: Download ISO with aria2
+      - name: Download ISO with aria2 (with DNS fix)
         working-directory: downloads
+        timeout-minutes: 360  # 6 hours max
         run: |
+          # Try with async-dns disabled to use system DNS
           aria2c \
+            --async-dns=false \
             --max-concurrent-downloads=${{ github.event.inputs.max_concurrent_downloads || '4' }} \
             --max-connection-per-server=${{ github.event.inputs.max_connection_per_server || '8' }} \
             --min-split-size=1M \
             --split=16 \
             --continue=true \
             --retry-wait=5 \
-            --max-tries=0 \
+            --max-tries=10 \
             --timeout=60 \
             --console-log-level=warn \
             --summary-interval=30 \
             --disk-cache=64M \
             --file-allocation=falloc \
             --remote-time=true \
-            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0" \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            --check-certificate=false \
             "https://drive.massgrave.dev/en-us_windows_10_iot_enterprise_ltsc_2021_x64_dvd_257ad90f.iso"
 
       - name: Verify download
         working-directory: downloads
         run: |
-          ls -lh *.iso
-          sha256sum *.iso || true
+          ls -lh *.iso || echo "No ISO found"
+          find . -type f -name "*.iso" -exec sha256sum {} \;
 
       - name: Upload ISO as artifact
         uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: windows-10-iot-ltsc-2021
           path: downloads/*.iso
-          retention-days: 1  # Adjust as needed
+          retention-days: 1
+          compression-level: 0  # No compression for binary files
           
